@@ -10,7 +10,7 @@
 	<packaging>jar</packaging>
 
 	<name>ra-btc</name>
-	<url>https://resolvingarchitecture.io</url>
+	<url>https://resolvingarchitecture.dev</url>
 	<description>Resolving Architecture - Bitcoin Client Java</description>
 	<inceptionYear>2020</inceptionYear>
 
@@ -30,7 +30,7 @@
 	<developers>
 		<developer>
 			<name>Brian Taylor</name>
-			<email>brian@resolvingarchitecture.io</email>
+			<email>brian@resolvingarchitecture.dev</email>
 		</developer>
 	</developers>
 
