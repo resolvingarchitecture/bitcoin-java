@@ -104,6 +104,8 @@ public class BitcoinJClient implements BitcoinClient {
 
     private NetworkParameters params;
     private WalletAppKit kit;
+    /** The peer limit the group started with, captured the first time {@link #OPERATION_SET_MAX_PEERS} lowers it. */
+    private int startupMaxPeers = -1;
     private long broadcastTimeoutMs = 15_000;
     private volatile Proxy externalProxy;
     private volatile BitcoinClient.ProxiedHostResolver externalSeedResolver;
@@ -663,6 +665,37 @@ public class BitcoinJClient implements BitcoinClient {
                     e.addErrorMessage("estimate failed: an output is too small to relay (dust)");
                 } catch (RuntimeException ex) {
                     e.addErrorMessage("estimate failed: " + ex);
+                }
+                break;
+            }
+            case OPERATION_SET_MAX_PEERS: {
+                String requested = stringHeaderOrNull(e, HEADER_MAX_PEERS);
+                PeerGroup group;
+                try {
+                    group = kit == null ? null : kit.peerGroup();
+                } catch (IllegalStateException notStarted) {
+                    group = null;
+                }
+                if (group == null) {
+                    e.addErrorMessage("wallet is not running");
+                    break;
+                }
+                synchronized (this) {
+                    if (startupMaxPeers < 0) startupMaxPeers = group.getMaxConnections();
+                    int target;
+                    try {
+                        target = "default".equalsIgnoreCase(requested) ? startupMaxPeers : Integer.parseInt(requested.trim());
+                    } catch (RuntimeException ex) {
+                        e.addErrorMessage("invalid " + HEADER_MAX_PEERS + ": " + requested);
+                        break;
+                    }
+                    if (target < 1) {
+                        e.addErrorMessage("invalid " + HEADER_MAX_PEERS + ": " + requested);
+                        break;
+                    }
+                    group.setMaxConnections(target);
+                    LOG.info("Bitcoin max peers set to " + target + " (startup " + startupMaxPeers + ")");
+                    e.setHeader(HEADER_MAX_PEERS, String.valueOf(target));
                 }
                 break;
             }

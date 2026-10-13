@@ -51,6 +51,12 @@ public interface BitcoinClient {
     String OPERATION_LIST_PENDING_BROADCASTS = "LIST_PENDING_BROADCASTS";
     String OPERATION_SEND = "SEND";
     String OPERATION_SYNC_STATUS = "SYNC_STATUS";
+    /**
+     * Caps how many peers the wallet keeps connected, at runtime: {@link #HEADER_MAX_PEERS} is a positive
+     * number, or {@code "default"} to restore the limit the client started with. Peers above a lowered cap
+     * are dropped. Lets a host ease the load on a shared transport (Tor) while something else needs it.
+     */
+    String OPERATION_SET_MAX_PEERS = "SET_MAX_PEERS";
 
     /**
      * Same inputs as {@link #OPERATION_SEND} (spends this client's own wallet
@@ -104,6 +110,8 @@ public interface BitcoinClient {
     String HEADER_SYNCING = "btc.syncing";
     String HEADER_BEST_HEIGHT = "btc.bestHeight";
     String HEADER_CONNECTED_PEERS = "btc.connectedPeers";
+    /** Request/response header for {@link #OPERATION_SET_MAX_PEERS}. */
+    String HEADER_MAX_PEERS = "btc.maxPeers";
     /** Request header for {@link #OPERATION_BROADCAST_TRANSACTION}: hex-encoded raw signed transaction bytes. */
     String HEADER_RAW_TX_HEX = "btc.rawTxHex";
     /**
