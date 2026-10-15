@@ -102,6 +102,14 @@ public interface BitcoinClient {
     String OPERATION_BROADCAST_TRANSACTION = "BROADCAST_TRANSACTION";
 
     // Request/response header names for the operations above.
+    /**
+     * {@link #HEADER_COUNT} (1..20) distinct addresses this wallet has never handed out before, newest index
+     * last, returned newline-separated in {@link #HEADER_ADDRESSES}. Unlike {@link #OPERATION_GET_RECEIVE_ADDRESS},
+     * which keeps returning the same current address until it is used, every call advances the wallet.
+     */
+    String OPERATION_GET_FRESH_RECEIVE_ADDRESSES = "GET_FRESH_RECEIVE_ADDRESSES";
+    String HEADER_COUNT = "btc.count";
+    String HEADER_ADDRESSES = "btc.addresses";
     String HEADER_BALANCE_SATS = "btc.balanceSats";
     String HEADER_AVAILABLE_SATS = "btc.availableSats";
     String HEADER_ADDRESS = "btc.address";
@@ -149,6 +157,41 @@ public interface BitcoinClient {
      * BitcoinJClient}), this leaves nothing for bitcoinj to return as change.
      */
     String HEADER_USE_ALL_INPUTS = "btc.useAllInputs";
+
+    /**
+     * Starts (or keeps running) a second, watch-only wallet for a vault: its own SPV chain and peers, scanning
+     * from {@link #HEADER_VAULT_SINCE} for payments to addresses derived from {@link #HEADER_VAULT_KEY}, a
+     * standard BIP32 (xpub/tpub) account key. {@link #HEADER_VAULT_TYPE} is {@code P2PKH} or {@code P2WPKH}.
+     * Idempotent for an unchanged key and date; a different key or date starts a fresh scan.
+     */
+    String OPERATION_VAULT_SCAN_START = "VAULT_SCAN_START";
+    /**
+     * Response: {@link #HEADER_VAULT_SCAN_STATE} ({@code NONE}, {@code SYNCING} or {@code SYNCED}),
+     * {@link #HEADER_BALANCE_SATS}, {@link #HEADER_BEST_HEIGHT} and the vault wallet's transactions as content,
+     * one {@code txid|valueSats|confirmations|updateTimeMillis} per line.
+     */
+    String OPERATION_VAULT_SCAN_STATUS = "VAULT_SCAN_STATUS";
+    /** Stops the vault scan and deletes its chain and wallet files. */
+    String OPERATION_VAULT_SCAN_CLEAR = "VAULT_SCAN_CLEAR";
+    String HEADER_VAULT_KEY = "btc.vault.key";
+    String HEADER_VAULT_TYPE = "btc.vault.type";
+    /** Epoch seconds the vault scan starts from. */
+    String HEADER_VAULT_SINCE = "btc.vault.since";
+    String HEADER_VAULT_SCAN_STATE = "btc.vault.scanState";
+
+    /**
+     * How many confirmations a received payment of {@code sats} needs before it counts as spendable: the more
+     * it is, the more confirmations. This is the one definition - the wallet's coin selection applies it when
+     * building a send, and the app shows balances by the same rule (mirrored in {@code BitcoinChannel}, with a test
+     * that keeps the two equal).
+     */
+    static int requiredConfirmations(long sats) {
+        long amount = sats == Long.MIN_VALUE ? Long.MAX_VALUE : Math.abs(sats);
+        if (amount < 20_000L) return 1;
+        if (amount < 1_000_000L) return 2;
+        if (amount < 10_000_000L) return 3;
+        return 4;
+    }
 
     // Lower Level Use Case Requests
     String OPERATION_CREATE_2_N_MULTISIG = "CREATE_2_N_MULTISIG";

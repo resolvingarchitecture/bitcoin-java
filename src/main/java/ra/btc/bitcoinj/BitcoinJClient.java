@@ -25,6 +25,8 @@ import org.bitcoinj.net.discovery.PeerDiscoveryException;
 import org.bitcoinj.script.Script;
 import org.bitcoinj.script.ScriptBuilder;
 import org.bitcoinj.script.ScriptException;
+import org.bitcoinj.wallet.CoinSelector;
+import org.bitcoinj.wallet.DefaultCoinSelector;
 import org.bitcoinj.wallet.CoinSelection;
 import org.bitcoinj.wallet.DeterministicSeed;
 import org.bitcoinj.wallet.KeyChainGroupStructure;
@@ -104,6 +106,8 @@ public class BitcoinJClient implements BitcoinClient {
 
     private NetworkParameters params;
     private WalletAppKit kit;
+    private BitcoinNetwork network;
+    private Properties initConfig;
     /** The peer limit the group started with, captured the first time {@link #OPERATION_SET_MAX_PEERS} lowers it. */
     private int startupMaxPeers = -1;
     private long broadcastTimeoutMs = 15_000;
@@ -156,12 +160,8 @@ public class BitcoinJClient implements BitcoinClient {
         }
         params = NetworkParameters.of(network);
         Context.propagate(new Context(params));
-
-        final Proxy proxy = externalProxy;
-        final String socksHost = config.getProperty("ra.btc.socks.host");
-        final int socksPort = parseIntOrDefault(config.getProperty("ra.btc.socks.port"), 0);
-        final boolean useSocks = proxy != null || (socksHost != null && !socksHost.isEmpty() && socksPort > 0);
-        final boolean noDirectPeers = "true".equalsIgnoreCase(config.getProperty("ra.btc.noDirectPeers"));
+        this.network = network;
+        this.initConfig = config;
 
         broadcastTimeoutMs = parseLongOrDefault(config.getProperty("ra.btc.broadcastTimeoutMs"), 15_000);
 
@@ -184,53 +184,7 @@ public class BitcoinJClient implements BitcoinClient {
         final int maxAttempts = 3;
         final long retryDelayMs = 250L;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            kit = new WalletAppKit(network, ScriptType.P2WPKH, KeyChainGroupStructure.BIP32, directory, "bitcoinj") {
-                @Override
-                protected void onSetupCompleted() {
-                    peerGroup().addConnectedEventListener((peer, count) ->
-                            LOG.info("Bitcoin peer connected count=" + count + " peerHeight=" + peer.getBestHeight()));
-                    peerGroup().addDisconnectedEventListener((peer, count) ->
-                            LOG.info("Bitcoin peer disconnected remaining=" + count
-                                    + " services=" + (peer.getPeerVersionMessage() == null ? "no handshake"
-                                    : peer.getPeerVersionMessage().services())));
-                    peerGroup().addBlocksDownloadedEventListener((peer, block, filtered, remaining) -> {
-                        int height = chain().getBestChainHeight();
-                        if (remaining == 0 || height % 10 == 0)
-                            LOG.info("Bitcoin sync height=" + height + " blocksRemaining=" + remaining);
-                    });
-                }
-
-                @Override
-                protected PeerGroup createPeerGroup() {
-                    if (!useSocks) {
-                        return super.createPeerGroup();
-                    }
-                    SocketFactory socksSocketFactory;
-                    if (proxy != null) {
-                        LOG.info("Routing Bitcoin P2P connections through supplied SOCKS proxy " + proxy);
-                        socksSocketFactory = socksSocketFactory(proxy);
-                    } else {
-                        LOG.info("Routing Bitcoin P2P connections through SOCKS proxy " + socksHost + ":" + socksPort);
-                        socksSocketFactory = socksSocketFactory(new Proxy(Proxy.Type.SOCKS, new InetSocketAddress(socksHost, socksPort)));
-                    }
-                    BlockingClientManager connectionManager = new BlockingClientManager(socksSocketFactory) {
-                        @Override
-                        public org.bitcoinj.utils.ListenableCompletableFuture<java.net.SocketAddress> openConnection(
-                                java.net.SocketAddress address, org.bitcoinj.net.StreamConnection connection) {
-                            org.bitcoinj.utils.ListenableCompletableFuture<java.net.SocketAddress> result = super.openConnection(address, connection);
-                            result.whenComplete((connected, error) -> {
-                                if (error != null) LOG.log(java.util.logging.Level.WARNING, "Bitcoin SOCKS connection failed", error);
-                                else LOG.info("Bitcoin SOCKS connection established");
-                            });
-                            return result;
-                        }
-                    };
-                    connectionManager.setConnectTimeout(Duration.ofSeconds(45));
-                    PeerGroup peers = new SocksRoutedPeerGroup(network, vChain, connectionManager);
-                    peers.setConnectTimeout(Duration.ofSeconds(60));
-                    return peers;
-                }
-            };
+            kit = newKit(network, directory, "bitcoinj", ScriptType.P2WPKH, config);
 
             if (restoreFromSeed != null) {
                 kit.restoreWalletFromSeed(restoreFromSeed);
@@ -243,37 +197,6 @@ public class BitcoinJClient implements BitcoinClient {
                     LOG.severe("This service is already running and cannot be started twice.");
                     return false;
                 }
-
-                if (network == BitcoinNetwork.REGTEST) {
-                    kit.connectToLocalHost();
-                } else if (noDirectPeers) {
-                    // Explicitly empty, not merely absent: falling through to BitcoinJ's own DNS-seed
-                    // discovery here would leak a direct clearnet connection attempt, defeating the
-                    // whole reason this flag was set (no acceptable network path right now). The wallet
-                    // itself still starts - balance/receive-address/offline signing all work from cached
-                    // state - only the PeerGroup makes zero connection attempts.
-                    LOG.info("ra.btc.noDirectPeers=true - wallet starting with zero peer discovery.");
-                    kit.setDiscovery(new StaticBitcoinPeerDiscovery(java.util.Collections.emptyList()));
-                } else {
-                    List<InetSocketAddress> explicitPeers = parsePeers(config.getProperty("ra.btc.peers"));
-                    if (!explicitPeers.isEmpty()) {
-                        LOG.info("Using explicit Bitcoin peers: " + explicitPeers);
-                        kit.setDiscovery(new StaticBitcoinPeerDiscovery(explicitPeers));
-                    } else if (externalSeedResolver != null) {
-                        LOG.info("No explicit Bitcoin peers configured (ra.btc.peers) - resolving BitcoinJ's "
-                                + "own DNS seeds through the supplied proxied resolver instead of local DNS.");
-                        kit.setDiscovery(new ProxiedDnsSeedDiscovery(params.getDnsSeeds(), params.getPort(), externalSeedResolver));
-                    } else {
-                        LOG.info("No explicit Bitcoin peers configured (ra.btc.peers) - using BitcoinJ's "
-                                + "own default peer discovery, same fallback 1m5-android's WalletService uses.");
-                        // Deliberately not calling kit.setDiscovery(...) here - leaving WalletAppKit's
-                        // own PeerGroup default discovery (bitcoinj's built-in DNS-seed
-                        // MultiplexingDiscovery) in place. Only reached with no seed resolver supplied -
-                        // a real leak (see ProxiedDnsSeedDiscovery's javadoc) but the same behavior this
-                        // class has always had for a caller with no proxied-DNS notion.
-                    }
-                }
-                kit.setBlockingStartup(false);
 
                 kit.startAsync();
                 kit.awaitRunning();
@@ -296,6 +219,112 @@ public class BitcoinJClient implements BitcoinClient {
             }
         }
         return false; // unreachable - the loop above always returns
+    }
+
+    /**
+     * A {@link WalletAppKit} wired the way every wallet in this client is: P2P connections through the configured
+     * SOCKS proxy (or none at all with {@code ra.btc.noDirectPeers}), and peer discovery that never touches local
+     * DNS. Not started - the caller restores/starts it. The main wallet and the vault scanner both come from here.
+     */
+    private WalletAppKit newKit(BitcoinNetwork network, File directory, String prefix, ScriptType scriptType,
+                                Properties config) {
+        return newKit(network, directory, prefix, scriptType, config, null);
+    }
+
+    /** As above; with {@code watchKey} the kit's wallet is a watch-only wallet for that account public key. */
+    private WalletAppKit newKit(BitcoinNetwork network, File directory, String prefix, ScriptType scriptType,
+                                Properties config, DeterministicKey watchKey) {
+        final Proxy proxy = externalProxy;
+        final String socksHost = config.getProperty("ra.btc.socks.host");
+        final int socksPort = parseIntOrDefault(config.getProperty("ra.btc.socks.port"), 0);
+        final boolean useSocks = proxy != null || (socksHost != null && !socksHost.isEmpty() && socksPort > 0);
+        final boolean noDirectPeers = "true".equalsIgnoreCase(config.getProperty("ra.btc.noDirectPeers"));
+
+        WalletAppKit newKit = new WalletAppKit(network, scriptType, KeyChainGroupStructure.BIP32, directory, prefix) {
+            @Override
+            protected Wallet createWallet() {
+                // restoreWalletFromKey wants a private key; a public account key needs a watching wallet.
+                return watchKey != null ? Wallet.fromWatchingKey(network, watchKey, scriptType) : super.createWallet();
+            }
+
+            @Override
+            protected void onSetupCompleted() {
+                peerGroup().addConnectedEventListener((peer, count) ->
+                        LOG.info("Bitcoin peer connected count=" + count + " peerHeight=" + peer.getBestHeight()));
+                peerGroup().addDisconnectedEventListener((peer, count) ->
+                        LOG.info("Bitcoin peer disconnected remaining=" + count
+                                + " services=" + (peer.getPeerVersionMessage() == null ? "no handshake"
+                                : peer.getPeerVersionMessage().services())));
+                peerGroup().addBlocksDownloadedEventListener((peer, block, filtered, remaining) -> {
+                    int height = chain().getBestChainHeight();
+                    if (remaining == 0 || height % 10 == 0)
+                        LOG.info("Bitcoin sync height=" + height + " blocksRemaining=" + remaining);
+                });
+            }
+
+            @Override
+            protected PeerGroup createPeerGroup() {
+                if (!useSocks) {
+                    return super.createPeerGroup();
+                }
+                SocketFactory socksSocketFactory;
+                if (proxy != null) {
+                    LOG.info("Routing Bitcoin P2P connections through supplied SOCKS proxy " + proxy);
+                    socksSocketFactory = socksSocketFactory(proxy);
+                } else {
+                    LOG.info("Routing Bitcoin P2P connections through SOCKS proxy " + socksHost + ":" + socksPort);
+                    socksSocketFactory = socksSocketFactory(new Proxy(Proxy.Type.SOCKS, new InetSocketAddress(socksHost, socksPort)));
+                }
+                BlockingClientManager connectionManager = new BlockingClientManager(socksSocketFactory) {
+                    @Override
+                    public org.bitcoinj.utils.ListenableCompletableFuture<java.net.SocketAddress> openConnection(
+                            java.net.SocketAddress address, org.bitcoinj.net.StreamConnection connection) {
+                        org.bitcoinj.utils.ListenableCompletableFuture<java.net.SocketAddress> result = super.openConnection(address, connection);
+                        result.whenComplete((connected, error) -> {
+                            if (error != null) LOG.log(java.util.logging.Level.WARNING, "Bitcoin SOCKS connection failed", error);
+                            else LOG.info("Bitcoin SOCKS connection established");
+                        });
+                        return result;
+                    }
+                };
+                connectionManager.setConnectTimeout(Duration.ofSeconds(45));
+                PeerGroup peers = new SocksRoutedPeerGroup(network, vChain, connectionManager);
+                peers.setConnectTimeout(Duration.ofSeconds(60));
+                return peers;
+            }
+        };
+
+        if (network == BitcoinNetwork.REGTEST) {
+            newKit.connectToLocalHost();
+        } else if (noDirectPeers) {
+            // Explicitly empty, not merely absent: falling through to BitcoinJ's own DNS-seed
+            // discovery here would leak a direct clearnet connection attempt, defeating the
+            // whole reason this flag was set (no acceptable network path right now). The wallet
+            // itself still starts - balance/receive-address/offline signing all work from cached
+            // state - only the PeerGroup makes zero connection attempts.
+            LOG.info("ra.btc.noDirectPeers=true - wallet starting with zero peer discovery.");
+            newKit.setDiscovery(new StaticBitcoinPeerDiscovery(java.util.Collections.emptyList()));
+        } else {
+            List<InetSocketAddress> explicitPeers = parsePeers(config.getProperty("ra.btc.peers"));
+            if (!explicitPeers.isEmpty()) {
+                LOG.info("Using explicit Bitcoin peers: " + explicitPeers);
+                newKit.setDiscovery(new StaticBitcoinPeerDiscovery(explicitPeers));
+            } else if (externalSeedResolver != null) {
+                LOG.info("No explicit Bitcoin peers configured (ra.btc.peers) - resolving BitcoinJ's "
+                        + "own DNS seeds through the supplied proxied resolver instead of local DNS.");
+                newKit.setDiscovery(new ProxiedDnsSeedDiscovery(params.getDnsSeeds(), params.getPort(), externalSeedResolver));
+            } else {
+                LOG.info("No explicit Bitcoin peers configured (ra.btc.peers) - using BitcoinJ's "
+                        + "own default peer discovery, same fallback 1m5-android's WalletService uses.");
+                // Deliberately not calling newKit.setDiscovery(...) here - leaving WalletAppKit's
+                // own PeerGroup default discovery (bitcoinj's built-in DNS-seed
+                // MultiplexingDiscovery) in place. Only reached with no seed resolver supplied -
+                // a real leak (see ProxiedDnsSeedDiscovery's javadoc) but the same behavior this
+                // class has always had for a caller with no proxied-DNS notion.
+            }
+        }
+        newKit.setBlockingStartup(false);
+        return newKit;
     }
 
     /** Walks {@code t}'s cause chain - see {@link #init}'s retry-loop comment for why this matters. */
@@ -517,6 +546,22 @@ public class BitcoinJClient implements BitcoinClient {
                 e.setHeader(HEADER_ADDRESS, kit.wallet().currentReceiveAddress().toString());
                 break;
             }
+            case OPERATION_GET_FRESH_RECEIVE_ADDRESSES: {
+                int count;
+                try {
+                    count = Integer.parseInt(String.valueOf(e.getHeader(HEADER_COUNT)).trim());
+                } catch (NumberFormatException ex) {
+                    count = 1;
+                }
+                count = Math.max(1, Math.min(20, count));
+                StringBuilder fresh = new StringBuilder();
+                for (int i = 0; i < count; i++) {
+                    if (i > 0) fresh.append('\n');
+                    fresh.append(kit.wallet().freshReceiveAddress(kit.wallet().getActiveKeyChain().getOutputScriptType()));
+                }
+                e.setHeader(HEADER_ADDRESSES, fresh.toString());
+                break;
+            }
             case OPERATION_LIST_TRANSACTIONS: {
                 // Dependency-free encoding, not org.json: this module runs on plain-JVM hosts
                 // (the 1m5-core-java desktop daemon) as well as Android (via 1m5-remnant), and
@@ -573,7 +618,7 @@ public class BitcoinJClient implements BitcoinClient {
                 try {
                     Address address = Address.fromString(params, addressStr);
                     long sats = Long.parseLong(amountStr);
-                    SendRequest req = useAllInputsIfRequested(e, applyFeeRate(e, addFeeOutput(e, SendRequest.to(address, Coin.valueOf(sats)))));
+                    SendRequest req = applyConfirmationPolicy(useAllInputsIfRequested(e, applyFeeRate(e, addFeeOutput(e, SendRequest.to(address, Coin.valueOf(sats))))));
                     Wallet.SendResult result = kit.wallet().sendCoins(kit.peerGroup(), req);
                     e.setHeader(HEADER_TXID, result.transaction().getTxId().toString());
                 } catch (AddressFormatException ex) {
@@ -607,7 +652,7 @@ public class BitcoinJClient implements BitcoinClient {
                 try {
                     Address address = Address.fromString(params, addressStr);
                     long sats = Long.parseLong(amountStr);
-                    SendRequest req = useAllInputsIfRequested(e, applyFeeRate(e, addFeeOutput(e, SendRequest.to(address, Coin.valueOf(sats)))));
+                    SendRequest req = applyConfirmationPolicy(useAllInputsIfRequested(e, applyFeeRate(e, addFeeOutput(e, SendRequest.to(address, Coin.valueOf(sats))))));
                     Transaction tx = kit.wallet().sendCoinsOffline(req);
                     e.setHeader(HEADER_TXID, tx.getTxId().toString());
                     e.setHeader(HEADER_RAW_TX_HEX, bytesToHex(tx.serialize()));
@@ -638,7 +683,7 @@ public class BitcoinJClient implements BitcoinClient {
                 try {
                     Address address = Address.fromString(params, addressStr);
                     long sats = Long.parseLong(amountStr);
-                    SendRequest req = useAllInputsIfRequested(e, applyFeeRate(e, addFeeOutput(e, SendRequest.to(address, Coin.valueOf(sats)))));
+                    SendRequest req = applyConfirmationPolicy(useAllInputsIfRequested(e, applyFeeRate(e, addFeeOutput(e, SendRequest.to(address, Coin.valueOf(sats))))));
                     // completeTx alone (not sendCoins/sendCoinsOffline, neither of which this
                     // calls) selects coins and computes the fee without ever calling commitTx -
                     // no side effects, safe to call on every keystroke. See BitcoinClient's javadoc.
@@ -732,6 +777,18 @@ public class BitcoinJClient implements BitcoinClient {
                 e.setHeader(HEADER_SYNCING, String.valueOf(syncing));
                 e.setHeader(HEADER_BEST_HEIGHT, String.valueOf(bestHeight));
                 e.setHeader(HEADER_CONNECTED_PEERS, String.valueOf(connectedPeers));
+                break;
+            }
+            case OPERATION_VAULT_SCAN_START: {
+                startVaultScan(e);
+                break;
+            }
+            case OPERATION_VAULT_SCAN_STATUS: {
+                vaultScanStatus(e);
+                break;
+            }
+            case OPERATION_VAULT_SCAN_CLEAR: {
+                clearVaultScan();
                 break;
             }
             case OPERATION_BROADCAST_TRANSACTION: {
@@ -842,6 +899,35 @@ public class BitcoinJClient implements BitcoinClient {
     }
 
     /**
+     * Makes a send spend only coins the wallet counts as spendable: a payment received from someone else must have the
+     * confirmations {@link BitcoinClient#requiredConfirmations} asks for its size, and change from this wallet's own
+     * sends is left to bitcoinj's usual rule. Without this, bitcoinj spends any coin with a single confirmation, so
+     * the wallet could send funds its own balance still shows as locked. Applies to a "send everything" selector too.
+     */
+    private SendRequest applyConfirmationPolicy(SendRequest req) {
+        CoinSelector base = req.coinSelector != null ? req.coinSelector : DefaultCoinSelector.get(network);
+        Wallet wallet = kit.wallet();
+        req.coinSelector = (target, candidates) -> {
+            java.util.List<TransactionOutput> allowed = new ArrayList<>();
+            for (TransactionOutput o : candidates) {
+                if (meetsConfirmationPolicy(wallet, o)) allowed.add(o);
+            }
+            return base.select(target, allowed);
+        };
+        return req;
+    }
+
+    static boolean meetsConfirmationPolicy(Wallet wallet, TransactionOutput o) {
+        Transaction parent = o.getParentTransaction();
+        try {
+            if (parent != null && parent.getValueSentFromMe(wallet).signum() > 0) return true; // our own change
+        } catch (ScriptException ex) {
+            return false;
+        }
+        return o.getParentTransactionDepthInBlocks() >= BitcoinClient.requiredConfirmations(o.getValue().value);
+    }
+
+    /**
      * See {@link BitcoinClient#HEADER_USE_ALL_INPUTS}: when {@code "true"}, replaces bitcoinj's
      * default "select just enough" coin selection with one that unconditionally spends every
      * candidate it's given - {@code req} is returned unchanged otherwise. Bitcoinj's own change
@@ -941,10 +1027,142 @@ public class BitcoinJClient implements BitcoinClient {
         kit.peerGroup().broadcastTransaction(escrow.tx);
     }
 
+    // -- vault scan --------------------------------------------------------
+
+    private WalletAppKit vaultKit;
+    private String vaultFingerprint;
+
+    private File vaultDirectory() {
+        return new File(kitDirectory(), "vault");
+    }
+
+    private File kitDirectory() {
+        return service.getServiceDirectory();
+    }
+
+    /**
+     * The watch-only vault wallet, kept apart from the main wallet and its chain: replaying history from the
+     * vault's start date means a chain of its own, and the main wallet must not be reset to do it. Started from the
+     * nearest bundled checkpoint before the date, so only headers from there on are fetched.
+     */
+    private synchronized void startVaultScan(Envelope e) {
+        String key = stringHeaderOrNull(e, HEADER_VAULT_KEY);
+        String typeStr = stringHeaderOrNull(e, HEADER_VAULT_TYPE);
+        String sinceStr = stringHeaderOrNull(e, HEADER_VAULT_SINCE);
+        if (key == null || sinceStr == null) {
+            e.addErrorMessage("vault scan needs " + HEADER_VAULT_KEY + " and " + HEADER_VAULT_SINCE);
+            return;
+        }
+        ScriptType type;
+        if ("P2WPKH".equals(typeStr)) type = ScriptType.P2WPKH;
+        else if ("P2PKH".equals(typeStr)) type = ScriptType.P2PKH;
+        else {
+            e.addErrorMessage("the vault balance can only be tracked for xpub (legacy) and zpub (native segwit) keys");
+            return;
+        }
+        long sinceSeconds;
+        try {
+            sinceSeconds = Long.parseLong(sinceStr.trim());
+        } catch (NumberFormatException ex) {
+            e.addErrorMessage("invalid vault start date");
+            return;
+        }
+        String fingerprint = key.trim() + "|" + type + "|" + sinceSeconds;
+        if (vaultKit != null && fingerprint.equals(vaultFingerprint)
+                && vaultKit.state() != com.google.common.util.concurrent.Service.State.FAILED
+                && vaultKit.state() != com.google.common.util.concurrent.Service.State.TERMINATED) {
+            return; // already scanning this vault
+        }
+        File dir = vaultDirectory();
+        File marker = new File(dir, "vault.fingerprint");
+        boolean sameAsOnDisk = false;
+        try {
+            sameAsOnDisk = marker.exists()
+                    && fingerprint.equals(new String(java.nio.file.Files.readAllBytes(marker.toPath()), StandardCharsets.UTF_8));
+        } catch (IOException ignored) {
+            // treated as a different vault below: scan afresh
+        }
+        stopVaultKit();
+        if (!sameAsOnDisk) deleteRecursively(dir);
+
+        try {
+            DeterministicKey account = DeterministicKey.deserializeB58(key.trim(), network);
+            account.setCreationTime(java.time.Instant.ofEpochSecond(sinceSeconds));
+            WalletAppKit k = newKit(network, dir, "vault", type, initConfig, account);
+            if (network != BitcoinNetwork.REGTEST) {
+                k.setCheckpoints(org.bitcoinj.core.CheckpointManager.openStream(params));
+            }
+            k.startAsync();
+            vaultKit = k;
+            vaultFingerprint = fingerprint;
+            if (!dir.exists() && !dir.mkdirs()) LOG.warning("could not create " + dir);
+            java.nio.file.Files.write(marker.toPath(), fingerprint.getBytes(StandardCharsets.UTF_8));
+            LOG.info("vault scan started from " + java.time.Instant.ofEpochSecond(sinceSeconds));
+        } catch (RuntimeException | IOException ex) {
+            LOG.log(java.util.logging.Level.WARNING, "vault scan failed to start", ex);
+            stopVaultKit();
+            e.addErrorMessage("could not start the vault scan: " + ex.getMessage());
+        }
+    }
+
+    private synchronized void vaultScanStatus(Envelope e) {
+        WalletAppKit k = vaultKit;
+        if (k == null || !k.isRunning()) {
+            e.setHeader(HEADER_VAULT_SCAN_STATE, k == null ? "NONE" : "SYNCING");
+            return;
+        }
+        Wallet w = k.wallet();
+        boolean syncing = true;
+        if (k.peerGroup() != null && k.chain() != null && !k.peerGroup().getConnectedPeers().isEmpty()) {
+            syncing = k.peerGroup().getMostCommonChainHeight() > k.chain().getBestChainHeight();
+        }
+        e.setHeader(HEADER_VAULT_SCAN_STATE, syncing ? "SYNCING" : "SYNCED");
+        e.setHeader(HEADER_BALANCE_SATS, String.valueOf(w.getBalance(Wallet.BalanceType.ESTIMATED).value));
+        e.setHeader(HEADER_BEST_HEIGHT, String.valueOf(k.chain() != null ? k.chain().getBestChainHeight() : -1));
+        StringBuilder sb = new StringBuilder();
+        try {
+            for (Transaction tx : w.getTransactions(false)) {
+                sb.append(tx.getTxId()).append('|').append(tx.getValue(w).value).append('|')
+                        .append(tx.getConfidence().getDepthInBlocks()).append('|')
+                        .append(tx.getUpdateTime().getTime()).append('\n');
+            }
+        } catch (ScriptException ex) {
+            e.addErrorMessage("could not list vault transactions: " + ex.getMessage());
+            return;
+        }
+        e.addContent(sb.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private synchronized void clearVaultScan() {
+        stopVaultKit();
+        deleteRecursively(vaultDirectory());
+    }
+
+    private void stopVaultKit() {
+        if (vaultKit == null) return;
+        try {
+            vaultKit.stopAsync();
+            vaultKit.awaitTerminated(30, TimeUnit.SECONDS);
+        } catch (RuntimeException | TimeoutException ex) {
+            LOG.log(java.util.logging.Level.WARNING, "vault scan did not stop cleanly", ex);
+        }
+        vaultKit = null;
+        vaultFingerprint = null;
+    }
+
+    private static void deleteRecursively(File f) {
+        File[] children = f.listFiles();
+        if (children != null) for (File c : children) deleteRecursively(c);
+        f.delete();
+    }
+
     @Override
     public boolean destroy() throws Exception {
         // WalletAppKit auto-saves the wallet (default) and persists the SPV chain file itself;
         // stopAsync()/awaitTerminated() flushes both to disk.
+        synchronized (this) {
+            stopVaultKit();
+        }
         if (kit != null) {
             kit.stopAsync();
             kit.awaitTerminated();
