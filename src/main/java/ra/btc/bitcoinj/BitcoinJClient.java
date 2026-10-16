@@ -159,7 +159,14 @@ public class BitcoinJClient implements BitcoinClient {
             LOG.info("BitcoinJ Client in RegTest mode.");
         }
         params = NetworkParameters.of(network);
-        Context.propagate(new Context(params));
+        // One bitcoinj Context per wallet. A Context owns the table of transaction confidence, so wallets that share
+        // one share a single confidence object for every transaction they both hold, and a payment from the main
+        // wallet to the vault is exactly that: the vault wallet's older "pending" copy then overwrites the main
+        // wallet's "confirmed", and loading the vault wallet can fail outright ("source cannot be set again").
+        // Threads with no Context of their own fall back to the last one made, so the main wallet's is made last.
+        vaultContext = new Context(params);
+        mainContext = new Context(params);
+        Context.propagate(mainContext);
         this.network = network;
         this.initConfig = config;
 
@@ -228,17 +235,24 @@ public class BitcoinJClient implements BitcoinClient {
      */
     private WalletAppKit newKit(BitcoinNetwork network, File directory, String prefix, ScriptType scriptType,
                                 Properties config) {
-        return newKit(network, directory, prefix, scriptType, config, null);
+        return newKit(network, directory, prefix, scriptType, config, null, mainContext);
     }
 
     /** As above; with {@code watchKey} the kit's wallet is a watch-only wallet for that account public key. */
     /**
-     * Repairs a wallet file saved in the middle of a block being applied. The file then holds a transaction in the
-     * wallet's pending pool whose confidence already says it is in a block, with no block recorded for it, and
-     * bitcoinj refuses to load that ("expected PENDING or IN_CONFLICT, was BUILDING"), which leaves the whole wallet
-     * unavailable. Marking such a transaction pending again is all it needs: the block it appeared in is applied
-     * again when the chain catches up with the wallet, and the transaction is confirmed normally. Keys and every
-     * other transaction are untouched. A file that is missing, unreadable or already consistent is left alone.
+     * Repairs two states bitcoinj can leave a wallet file in, either of which keeps a payment from showing as
+     * confirmed or stops the wallet loading at all. Keys and every other transaction are untouched.
+     *
+     * <p>A file saved while a block was being applied holds a transaction in the pending pool whose confidence already
+     * says it is in a block, with no block recorded for it; bitcoinj refuses to load that ("expected PENDING or
+     * IN_CONFLICT, was BUILDING"). Marking it pending again is enough: the block is applied again as the chain catches
+     * up.
+     *
+     * <p>A transaction can also be left pending although a block is recorded for it. When that block is on the best
+     * chain in the wallet's own chain file, and the wallet has already seen that far, nothing will ever apply the block
+     * again, so the transaction would stay at zero confirmations for good. It is marked confirmed in that block.
+     *
+     * <p>A file that is missing, unreadable or already consistent is left alone.
      *
      * @return how many transactions were repaired
      */
@@ -250,6 +264,7 @@ public class BitcoinJClient implements BitcoinClient {
                 wallet = org.bitcoinj.protobuf.wallet.Protos.Wallet.parseFrom(in).toBuilder();
             }
             int repaired = 0;
+            java.util.Set<org.bitcoinj.base.Sha256Hash> stranded = new java.util.HashSet<>();
             for (int i = 0; i < wallet.getTransactionCount(); i++) {
                 org.bitcoinj.protobuf.wallet.Protos.Transaction tx = wallet.getTransaction(i);
                 if (tx.getPool() == org.bitcoinj.protobuf.wallet.Protos.Transaction.Pool.PENDING
@@ -259,8 +274,15 @@ public class BitcoinJClient implements BitcoinClient {
                             .setType(org.bitcoinj.protobuf.wallet.Protos.TransactionConfidence.Type.PENDING)
                             .clearAppearedAtHeight().clearDepth()));
                     repaired++;
+                } else if (tx.getPool() != org.bitcoinj.protobuf.wallet.Protos.Transaction.Pool.PENDING
+                        && tx.getConfidence().getType() == org.bitcoinj.protobuf.wallet.Protos.TransactionConfidence.Type.PENDING
+                        && tx.getBlockHashCount() > 0) {
+                    for (com.google.protobuf.ByteString h : tx.getBlockHashList()) {
+                        stranded.add(org.bitcoinj.base.Sha256Hash.wrap(h.toByteArray()));
+                    }
                 }
             }
+            if (!stranded.isEmpty()) repaired += confirmStranded(wallet, stranded, chainFileFor(walletFile));
             if (repaired == 0) return 0;
             File tmp = new File(walletFile.getParentFile(), walletFile.getName() + ".repair.tmp");
             try (java.io.FileOutputStream out = new java.io.FileOutputStream(tmp)) {
@@ -269,7 +291,7 @@ public class BitcoinJClient implements BitcoinClient {
             }
             java.nio.file.Files.move(tmp.toPath(), walletFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             LOG.warning("repaired " + repaired + " transaction(s) in " + walletFile.getName()
-                    + " left half-updated by an interrupted save");
+                    + " left in a half-updated state");
             return repaired;
         } catch (IOException | RuntimeException ex) {
             LOG.log(java.util.logging.Level.WARNING, "could not check " + walletFile.getName() + " for an interrupted save", ex);
@@ -277,8 +299,72 @@ public class BitcoinJClient implements BitcoinClient {
         }
     }
 
+    /** The chain file that goes with a wallet file: {@code x.wallet} keeps its blocks in {@code x.spvchain}. */
+    private static File chainFileFor(File walletFile) {
+        String name = walletFile.getName();
+        String base = name.endsWith(".wallet") ? name.substring(0, name.length() - ".wallet".length()) : name;
+        return new File(walletFile.getParentFile(), base + ".spvchain");
+    }
+
+    /**
+     * Marks the transactions left pending, whose recorded block is on the best chain at or below the height the wallet
+     * has seen, as confirmed in that block. Returns how many were.
+     */
+    private static int confirmStranded(org.bitcoinj.protobuf.wallet.Protos.Wallet.Builder wallet,
+                                       java.util.Set<org.bitcoinj.base.Sha256Hash> blockHashes, File chainFile) {
+        if (!chainFile.isFile()) return 0;
+        NetworkParameters chainParams;
+        try {
+            chainParams = NetworkParameters.fromID(wallet.getNetworkIdentifier());
+        } catch (RuntimeException ex) {
+            return 0;
+        }
+        if (chainParams == null) return 0;
+        java.util.Map<org.bitcoinj.base.Sha256Hash, Integer> heights = new java.util.HashMap<>();
+        int head;
+        org.bitcoinj.store.SPVBlockStore store = null;
+        try {
+            store = new org.bitcoinj.store.SPVBlockStore(chainParams, chainFile);
+            org.bitcoinj.core.StoredBlock block = store.getChainHead();
+            head = block.getHeight();
+            for (int steps = 0; block != null && steps < 5000 && heights.size() < blockHashes.size(); steps++) {
+                if (blockHashes.contains(block.getHeader().getHash())) heights.put(block.getHeader().getHash(), block.getHeight());
+                block = store.get(block.getHeader().getPrevBlockHash());
+            }
+        } catch (org.bitcoinj.store.BlockStoreException | RuntimeException ex) {
+            LOG.log(java.util.logging.Level.WARNING, "could not read " + chainFile.getName() + " to confirm payments", ex);
+            return 0;
+        } finally {
+            if (store != null) {
+                try {
+                    store.close();
+                } catch (org.bitcoinj.store.BlockStoreException ignored) {
+                    // nothing left to do with a store that will not close
+                }
+            }
+        }
+        int seen = wallet.getLastSeenBlockHeight();
+        int confirmed = 0;
+        for (int i = 0; i < wallet.getTransactionCount(); i++) {
+            org.bitcoinj.protobuf.wallet.Protos.Transaction tx = wallet.getTransaction(i);
+            if (tx.getPool() == org.bitcoinj.protobuf.wallet.Protos.Transaction.Pool.PENDING
+                    || tx.getConfidence().getType() != org.bitcoinj.protobuf.wallet.Protos.TransactionConfidence.Type.PENDING) continue;
+            Integer height = null;
+            for (com.google.protobuf.ByteString h : tx.getBlockHashList()) {
+                Integer found = heights.get(org.bitcoinj.base.Sha256Hash.wrap(h.toByteArray()));
+                if (found != null) height = found;
+            }
+            if (height == null || height > seen || height > head) continue;
+            wallet.setTransaction(i, tx.toBuilder().setConfidence(tx.getConfidence().toBuilder()
+                    .setType(org.bitcoinj.protobuf.wallet.Protos.TransactionConfidence.Type.BUILDING)
+                    .setAppearedAtHeight(height).setDepth(Math.min(head, seen) - height + 1)));
+            confirmed++;
+        }
+        return confirmed;
+    }
+
     private WalletAppKit newKit(BitcoinNetwork network, File directory, String prefix, ScriptType scriptType,
-                                Properties config, DeterministicKey watchKey) {
+                                Properties config, DeterministicKey watchKey, Context kitContext) {
         repairInterruptedWalletSave(new File(directory, prefix + ".wallet"));
         final Proxy proxy = externalProxy;
         final String socksHost = config.getProperty("ra.btc.socks.host");
@@ -287,6 +373,19 @@ public class BitcoinJClient implements BitcoinClient {
         final boolean noDirectPeers = "true".equalsIgnoreCase(config.getProperty("ra.btc.noDirectPeers"));
 
         WalletAppKit newKit = new WalletAppKit(network, scriptType, KeyChainGroupStructure.BIP32, directory, prefix) {
+            // The kit starts and stops its wallet, chain and peers on threads of its own: give them this wallet's Context.
+            @Override
+            protected void startUp() throws Exception {
+                Context.propagate(kitContext);
+                super.startUp();
+            }
+
+            @Override
+            protected void shutDown() throws Exception {
+                Context.propagate(kitContext);
+                super.shutDown();
+            }
+
             @Override
             protected Wallet createWallet() {
                 // restoreWalletFromKey wants a private key; a public account key needs a watching wallet.
@@ -580,6 +679,9 @@ public class BitcoinJClient implements BitcoinClient {
     public void handleDocument(Envelope e) {
         Route route = e.getRoute();
         String operation = route.getOperation();
+        boolean forVault = OPERATION_VAULT_SCAN_START.equals(operation) || OPERATION_VAULT_SCAN_STATUS.equals(operation)
+                || OPERATION_VAULT_SCAN_CLEAR.equals(operation);
+        Context.propagate(forVault ? vaultContext : mainContext); // reading a transaction's confidence uses the thread's Context
         switch(operation) {
             case OPERATION_GET_BALANCE: {
                 Coin available = kit.wallet().getBalance(Wallet.BalanceType.AVAILABLE);
@@ -1076,6 +1178,8 @@ public class BitcoinJClient implements BitcoinClient {
     // -- vault scan --------------------------------------------------------
 
     private WalletAppKit vaultKit;
+    private Context mainContext;
+    private Context vaultContext;
     private String vaultFingerprint;
 
     private File vaultDirectory() {
@@ -1134,7 +1238,7 @@ public class BitcoinJClient implements BitcoinClient {
         try {
             DeterministicKey account = DeterministicKey.deserializeB58(key.trim(), network);
             account.setCreationTime(java.time.Instant.ofEpochSecond(sinceSeconds));
-            WalletAppKit k = newKit(network, dir, "vault", type, initConfig, account);
+            WalletAppKit k = newKit(network, dir, "vault", type, initConfig, account, vaultContext);
             if (network != BitcoinNetwork.REGTEST) {
                 k.setCheckpoints(org.bitcoinj.core.CheckpointManager.openStream(params));
             }
