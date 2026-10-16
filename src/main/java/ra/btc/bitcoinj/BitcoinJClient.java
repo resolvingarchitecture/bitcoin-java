@@ -232,8 +232,54 @@ public class BitcoinJClient implements BitcoinClient {
     }
 
     /** As above; with {@code watchKey} the kit's wallet is a watch-only wallet for that account public key. */
+    /**
+     * Repairs a wallet file saved in the middle of a block being applied. The file then holds a transaction in the
+     * wallet's pending pool whose confidence already says it is in a block, with no block recorded for it, and
+     * bitcoinj refuses to load that ("expected PENDING or IN_CONFLICT, was BUILDING"), which leaves the whole wallet
+     * unavailable. Marking such a transaction pending again is all it needs: the block it appeared in is applied
+     * again when the chain catches up with the wallet, and the transaction is confirmed normally. Keys and every
+     * other transaction are untouched. A file that is missing, unreadable or already consistent is left alone.
+     *
+     * @return how many transactions were repaired
+     */
+    static int repairInterruptedWalletSave(File walletFile) {
+        if (!walletFile.isFile()) return 0;
+        try {
+            org.bitcoinj.protobuf.wallet.Protos.Wallet.Builder wallet;
+            try (java.io.InputStream in = new java.io.FileInputStream(walletFile)) {
+                wallet = org.bitcoinj.protobuf.wallet.Protos.Wallet.parseFrom(in).toBuilder();
+            }
+            int repaired = 0;
+            for (int i = 0; i < wallet.getTransactionCount(); i++) {
+                org.bitcoinj.protobuf.wallet.Protos.Transaction tx = wallet.getTransaction(i);
+                if (tx.getPool() == org.bitcoinj.protobuf.wallet.Protos.Transaction.Pool.PENDING
+                        && tx.getConfidence().getType() == org.bitcoinj.protobuf.wallet.Protos.TransactionConfidence.Type.BUILDING
+                        && tx.getBlockHashCount() == 0) {
+                    wallet.setTransaction(i, tx.toBuilder().setConfidence(tx.getConfidence().toBuilder()
+                            .setType(org.bitcoinj.protobuf.wallet.Protos.TransactionConfidence.Type.PENDING)
+                            .clearAppearedAtHeight().clearDepth()));
+                    repaired++;
+                }
+            }
+            if (repaired == 0) return 0;
+            File tmp = new File(walletFile.getParentFile(), walletFile.getName() + ".repair.tmp");
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(tmp)) {
+                wallet.build().writeTo(out);
+                out.getFD().sync();
+            }
+            java.nio.file.Files.move(tmp.toPath(), walletFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            LOG.warning("repaired " + repaired + " transaction(s) in " + walletFile.getName()
+                    + " left half-updated by an interrupted save");
+            return repaired;
+        } catch (IOException | RuntimeException ex) {
+            LOG.log(java.util.logging.Level.WARNING, "could not check " + walletFile.getName() + " for an interrupted save", ex);
+            return 0;
+        }
+    }
+
     private WalletAppKit newKit(BitcoinNetwork network, File directory, String prefix, ScriptType scriptType,
                                 Properties config, DeterministicKey watchKey) {
+        repairInterruptedWalletSave(new File(directory, prefix + ".wallet"));
         final Proxy proxy = externalProxy;
         final String socksHost = config.getProperty("ra.btc.socks.host");
         final int socksPort = parseIntOrDefault(config.getProperty("ra.btc.socks.port"), 0);
@@ -1117,7 +1163,7 @@ public class BitcoinJClient implements BitcoinClient {
             syncing = k.peerGroup().getMostCommonChainHeight() > k.chain().getBestChainHeight();
         }
         e.setHeader(HEADER_VAULT_SCAN_STATE, syncing ? "SYNCING" : "SYNCED");
-        e.setHeader(HEADER_BALANCE_SATS, String.valueOf(w.getBalance(Wallet.BalanceType.ESTIMATED).value));
+        e.setHeader(HEADER_BALANCE_SATS, String.valueOf(confirmedVaultSats(w)));
         e.setHeader(HEADER_BEST_HEIGHT, String.valueOf(k.chain() != null ? k.chain().getBestChainHeight() : -1));
         StringBuilder sb = new StringBuilder();
         try {
@@ -1131,6 +1177,21 @@ public class BitcoinJClient implements BitcoinClient {
             return;
         }
         e.addContent(sb.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * The vault's balance counting only outputs with the confirmations {@link BitcoinClient#requiredConfirmations}
+     * asks for their size, the rule the main wallet's balance uses. Unconfirmed money is left out so the app can show
+     * it separately as pending, instead of counting it in the balance as well.
+     */
+    static long confirmedVaultSats(Wallet w) {
+        long sum = 0;
+        for (TransactionOutput o : w.calculateAllSpendCandidates(true, false)) {
+            if (o.getParentTransactionDepthInBlocks() >= BitcoinClient.requiredConfirmations(o.getValue().value)) {
+                sum += o.getValue().value;
+            }
+        }
+        return sum;
     }
 
     private synchronized void clearVaultScan() {
