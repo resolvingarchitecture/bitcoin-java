@@ -42,6 +42,20 @@ public interface BitcoinClient {
      */
     default void setSeedResolver(ProxiedHostResolver resolver) {}
 
+    /**
+     * Start from the wallet these BIP-39 {@code words} make instead of the one on disk: the existing wallet and
+     * chain files are deleted first, and the wallet is rebuilt from the words, scanning from
+     * {@code creationEpochSeconds} (0 = unknown, scan from the start). Call before {@link #init}. Default no-op.
+     */
+    default void setRestorePhrase(java.util.List<String> words, long creationEpochSeconds) {}
+
+    /**
+     * The wallet's own BIP-39 words, space-separated in {@link #HEADER_WORDS}. Sensitive: only for a back-up
+     * screen the user has unlocked, never logged or stored.
+     */
+    String OPERATION_GET_WALLET_WORDS = "GET_WALLET_WORDS";
+    String HEADER_WORDS = "btc.words";
+
     // ** Wallet query/send - the operations a host actually needs for a real wallet UI, as
     // opposed to the lower/upper-level use cases below, none of which are implemented yet. **
     String OPERATION_GET_BALANCE = "GET_BALANCE";

@@ -103,6 +103,8 @@ public class BitcoinJClient implements BitcoinClient {
 
     private DeterministicSeed restoreFromSeed;
     private DeterministicKey restoreFromKey;
+    private java.util.List<String> restoreWords;
+    private long restoreCreationSeconds;
 
     private NetworkParameters params;
     private WalletAppKit kit;
@@ -118,6 +120,13 @@ public class BitcoinJClient implements BitcoinClient {
 
     public BitcoinJClient(BitcoinService service) {
         this.service = service;
+    }
+
+    /** See {@link BitcoinClient#setRestorePhrase}. Must be called before {@link #init}. */
+    @Override
+    public void setRestorePhrase(java.util.List<String> words, long creationEpochSeconds) {
+        this.restoreWords = words == null ? null : new java.util.ArrayList<>(words);
+        this.restoreCreationSeconds = creationEpochSeconds;
     }
 
     /** See {@link BitcoinClient#setProxy}. Must be called before {@link #init}. */
@@ -188,10 +197,24 @@ public class BitcoinJClient implements BitcoinClient {
          * including reconstructing {@code kit} from scratch, since a once-failed {@code
          * WalletAppKit} can't be restarted - rather than patching each call site separately.
          */
+        if (restoreWords != null) {
+            // The words replace the wallet outright: WalletAppKit only restores into a directory with no wallet.
+            for (String suffix : new String[]{".wallet", ".spvchain", ".wallet.repair.tmp"}) {
+                File f = new File(directory, "bitcoinj" + suffix);
+                if (f.exists() && !f.delete()) {
+                    LOG.severe("could not remove " + f.getName() + " before restoring the wallet from its words");
+                    return false;
+                }
+            }
+            restoreFromSeed = DeterministicSeed.ofMnemonic(restoreWords, "",
+                    java.time.Instant.ofEpochSecond(restoreCreationSeconds));
+            restoreWords = null; // the seed keeps its own list
+        }
         final int maxAttempts = 3;
         final long retryDelayMs = 250L;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            kit = newKit(network, directory, "bitcoinj", ScriptType.P2WPKH, config);
+            kit = newKit(network, directory, "bitcoinj", ScriptType.P2WPKH, config, null, mainContext,
+                    KeyChainGroupStructure.BIP43);
 
             if (restoreFromSeed != null) {
                 kit.restoreWalletFromSeed(restoreFromSeed);
@@ -235,7 +258,7 @@ public class BitcoinJClient implements BitcoinClient {
      */
     private WalletAppKit newKit(BitcoinNetwork network, File directory, String prefix, ScriptType scriptType,
                                 Properties config) {
-        return newKit(network, directory, prefix, scriptType, config, null, mainContext);
+        return newKit(network, directory, prefix, scriptType, config, null, mainContext, KeyChainGroupStructure.BIP32);
     }
 
     /** As above; with {@code watchKey} the kit's wallet is a watch-only wallet for that account public key. */
@@ -364,7 +387,8 @@ public class BitcoinJClient implements BitcoinClient {
     }
 
     private WalletAppKit newKit(BitcoinNetwork network, File directory, String prefix, ScriptType scriptType,
-                                Properties config, DeterministicKey watchKey, Context kitContext) {
+                                Properties config, DeterministicKey watchKey, Context kitContext,
+                                KeyChainGroupStructure structure) {
         repairInterruptedWalletSave(new File(directory, prefix + ".wallet"));
         final Proxy proxy = externalProxy;
         final String socksHost = config.getProperty("ra.btc.socks.host");
@@ -372,7 +396,7 @@ public class BitcoinJClient implements BitcoinClient {
         final boolean useSocks = proxy != null || (socksHost != null && !socksHost.isEmpty() && socksPort > 0);
         final boolean noDirectPeers = "true".equalsIgnoreCase(config.getProperty("ra.btc.noDirectPeers"));
 
-        WalletAppKit newKit = new WalletAppKit(network, scriptType, KeyChainGroupStructure.BIP32, directory, prefix) {
+        WalletAppKit newKit = new WalletAppKit(network, scriptType, structure, directory, prefix) {
             // The kit starts and stops its wallet, chain and peers on threads of its own: give them this wallet's Context.
             @Override
             protected void startUp() throws Exception {
@@ -688,6 +712,15 @@ public class BitcoinJClient implements BitcoinClient {
                 Coin estimated = kit.wallet().getBalance(Wallet.BalanceType.ESTIMATED);
                 e.setHeader(HEADER_AVAILABLE_SATS, String.valueOf(available.value));
                 e.setHeader(HEADER_BALANCE_SATS, String.valueOf(estimated.value));
+                break;
+            }
+            case OPERATION_GET_WALLET_WORDS: {
+                org.bitcoinj.wallet.DeterministicSeed seed = kit.wallet().getKeyChainSeed();
+                if (seed == null || seed.getMnemonicCode() == null) {
+                    e.addErrorMessage("This wallet has no recovery words.");
+                } else {
+                    e.setHeader(HEADER_WORDS, String.join(" ", seed.getMnemonicCode()));
+                }
                 break;
             }
             case OPERATION_GET_RECEIVE_ADDRESS: {
@@ -1238,7 +1271,7 @@ public class BitcoinJClient implements BitcoinClient {
         try {
             DeterministicKey account = DeterministicKey.deserializeB58(key.trim(), network);
             account.setCreationTime(java.time.Instant.ofEpochSecond(sinceSeconds));
-            WalletAppKit k = newKit(network, dir, "vault", type, initConfig, account, vaultContext);
+            WalletAppKit k = newKit(network, dir, "vault", type, initConfig, account, vaultContext, KeyChainGroupStructure.BIP32);
             if (network != BitcoinNetwork.REGTEST) {
                 k.setCheckpoints(org.bitcoinj.core.CheckpointManager.openStream(params));
             }

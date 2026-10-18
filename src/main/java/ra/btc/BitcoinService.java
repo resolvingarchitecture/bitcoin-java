@@ -24,6 +24,8 @@ public class BitcoinService extends BaseService {
     private BitcoinClient client;
     private volatile Proxy pendingProxy;
     private volatile BitcoinClient.ProxiedHostResolver pendingSeedResolver;
+    private volatile java.util.List<String> pendingRestoreWords;
+    private volatile long pendingRestoreCreation;
 
     public BitcoinService() {}
 
@@ -46,6 +48,15 @@ public class BitcoinService extends BaseService {
     /** Staged the same way and for the same reason as {@link #setProxy} - see {@link BitcoinClient#setSeedResolver}. */
     public void setSeedResolver(BitcoinClient.ProxiedHostResolver resolver) {
         this.pendingSeedResolver = resolver;
+    }
+
+    /**
+     * Staged like {@link #setProxy}: the next {@link #start} rebuilds the wallet from {@code words} (see
+     * {@link BitcoinClient#setRestorePhrase}) and then forgets them, so later restarts keep that wallet.
+     */
+    public void setRestorePhrase(java.util.List<String> words, long creationEpochSeconds) {
+        this.pendingRestoreWords = words == null ? null : new java.util.ArrayList<>(words);
+        this.pendingRestoreCreation = creationEpochSeconds;
     }
 
     @Override
@@ -73,6 +84,8 @@ public class BitcoinService extends BaseService {
         }
         client.setProxy(pendingProxy);
         client.setSeedResolver(pendingSeedResolver);
+        java.util.List<String> restoreWords = pendingRestoreWords;
+        if (restoreWords != null) client.setRestorePhrase(restoreWords, pendingRestoreCreation);
         try {
             if(!client.init(config)) {
                 LOG.severe("Client initialization failed, exiting.");
@@ -81,6 +94,10 @@ public class BitcoinService extends BaseService {
         } catch (Exception e) {
             LOG.log(java.util.logging.Level.SEVERE, "Bitcoin client initialization failed: " + e.getLocalizedMessage(), e);
             return false;
+        }
+        if (restoreWords != null) {
+            pendingRestoreWords = null;
+            restoreWords.clear();
         }
         updateStatus(ServiceStatus.RUNNING);
         LOG.info("Started.");
