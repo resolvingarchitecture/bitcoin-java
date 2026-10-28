@@ -170,6 +170,11 @@ public final class Psbt {
 
     public Transaction unsignedTransaction() { return tx; }
 
+    /** True when both spend the same coins to the same outputs (version and lock time included). */
+    public boolean sameTransactionAs(Psbt other) {
+        return Arrays.equals(tx.serialize(), other.tx.serialize());
+    }
+
     public Fields input(int i) { return inputs.get(i); }
 
     public Fields output(int i) { return outputs.get(i); }
@@ -179,6 +184,11 @@ public final class Psbt {
     /** Sets what input {@code i} spends, which a signer needs to check the amount and fee. */
     public void setWitnessUtxo(int i, TransactionOutput spent) {
         inputs.get(i).put(IN_WITNESS_UTXO, spent.serialize());
+    }
+
+    /** Drops the full previous transaction of input {@code i}, keeping only the spent output (witness UTXO). */
+    public void removeNonWitnessUtxo(int i) {
+        inputs.get(i).remove(IN_NON_WITNESS_UTXO);
     }
 
     /** The whole previous transaction of input {@code i}: how a signer verifies the amount, and the fee, of a legacy coin. */

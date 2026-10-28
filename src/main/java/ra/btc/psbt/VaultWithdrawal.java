@@ -150,6 +150,156 @@ public final class VaultWithdrawal {
         return new Result(psbt, amount, fee, changeSats, chosen.size());
     }
 
+    /** @param rawTxHex the signed transaction, ready to broadcast; @param feeSats what the miners get */
+    public static final class Finished {
+        private final String rawTxHex;
+        private final long feeSats;
+
+        public Finished(String rawTxHex, long feeSats) {
+            this.rawTxHex = rawTxHex;
+            this.feeSats = feeSats;
+        }
+
+        public String rawTxHex() { return rawTxHex; }
+        public long feeSats() { return feeSats; }
+    }
+
+    /**
+     * Checks that what the signing device sent back is the withdrawal that was asked for - the same coins to the same
+     * outputs, nothing added or changed - then finalizes it and verifies every signature against the coin it spends.
+     * Throws with a message fit to show the user if anything is off, so a bad file or tap never reaches the network.
+     */
+    public static Finished finish(Psbt signed, Psbt request) {
+        if (!signed.sameTransactionAs(request)) {
+            throw new IllegalArgumentException("That is not the withdrawal you asked for: its coins or outputs differ.");
+        }
+        Transaction tx;
+        try {
+            tx = signed.finalizeAndExtract();
+        } catch (IllegalStateException e) {
+            throw new IllegalArgumentException(e.getMessage().contains("not signed")
+                    ? "The signing device has not signed this withdrawal yet." : e.getMessage());
+        }
+        long in = 0;
+        for (int i = 0; i < tx.getInputs().size(); i++) {
+            TransactionOutput spent = request.spentOutput(i);
+            if (spent == null) throw new IllegalArgumentException("A coin in the withdrawal is unknown.");
+            in += spent.getValue().value;
+            try {
+                Script pubKey = new Script(spent.getScriptBytes());
+                if (ScriptPattern.isP2WPKH(pubKey)) {
+                    pubKey.correctlySpends(tx, i, tx.getInput(i).getWitness(), spent.getValue(), pubKey, Script.ALL_VERIFY_FLAGS);
+                } else {
+                    tx.getInput(i).getScriptSig().correctlySpends(tx, i, pubKey, Script.ALL_VERIFY_FLAGS);
+                }
+            } catch (RuntimeException e) {
+                throw new IllegalArgumentException("A signature does not check out, so the transaction was not sent.");
+            }
+        }
+        long out = 0;
+        for (TransactionOutput o : tx.getOutputs()) out += o.getValue().value;
+        return new Finished(hex(tx.serialize()), in - out);
+    }
+
+    /**
+     * What a signing device returned, as text: a signed PSBT or, when it finalizes (a Coldcard's default), the finished
+     * transaction - raw bytes as base64, or hex. Either way it is checked the same way against the request.
+     */
+    public static Finished finishAny(String text, Psbt request) {
+        byte[] bytes = decode(text);
+        if (bytes.length >= 5 && bytes[0] == 'p' && bytes[1] == 's' && bytes[2] == 'b' && bytes[3] == 't' && (bytes[4] & 0xff) == 0xff) {
+            return finish(Psbt.parse(bytes), request);
+        }
+        Transaction tx;
+        try {
+            tx = Transaction.read(java.nio.ByteBuffer.wrap(bytes));
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException("That is not a withdrawal this app can read.");
+        }
+        return finishTransaction(tx, request);
+    }
+
+    /** A finished transaction must spend exactly the request's coins to exactly its outputs, with valid signatures. */
+    static Finished finishTransaction(Transaction tx, Psbt request) {
+        Transaction asked = request.unsignedTransaction();
+        String differs = null;
+        if (tx.getInputs().size() != asked.getInputs().size()) {
+            differs = "it spends " + tx.getInputs().size() + " coins, not " + asked.getInputs().size();
+        }
+        for (int i = 0; differs == null && i < tx.getInputs().size(); i++) {
+            if (!tx.getInput(i).getOutpoint().equals(asked.getInput(i).getOutpoint())) differs = "it spends different coins";
+        }
+        if (differs == null && tx.getOutputs().size() != asked.getOutputs().size()) {
+            differs = "it has " + tx.getOutputs().size() + " outputs, not " + asked.getOutputs().size();
+        }
+        for (int i = 0; differs == null && i < tx.getOutputs().size(); i++) {
+            if (!java.util.Arrays.equals(tx.getOutput(i).serialize(), asked.getOutput(i).serialize())) differs = "output " + i + " differs";
+        }
+        if (differs == null && tx.getVersion() != asked.getVersion()) differs = "its version is " + tx.getVersion();
+        if (differs == null && tx.getLockTime() != asked.getLockTime()) differs = "its lock time is " + tx.getLockTime();
+        for (int i = 0; differs == null && i < tx.getInputs().size(); i++) {
+            if (tx.getInput(i).getSequenceNumber() != asked.getInput(i).getSequenceNumber()) differs = "input " + i + " has another sequence number";
+        }
+        if (differs != null) throw new IllegalArgumentException("That is not the withdrawal you asked for: " + differs + ".");
+        long in = 0;
+        for (int i = 0; i < tx.getInputs().size(); i++) {
+            TransactionOutput spent = request.spentOutput(i);
+            if (spent == null) throw new IllegalArgumentException("A coin in the withdrawal is unknown.");
+            in += spent.getValue().value;
+            try {
+                Script pubKey = new Script(spent.getScriptBytes());
+                if (ScriptPattern.isP2WPKH(pubKey)) {
+                    pubKey.correctlySpends(tx, i, tx.getInput(i).getWitness(), spent.getValue(), pubKey, Script.ALL_VERIFY_FLAGS);
+                } else {
+                    tx.getInput(i).getScriptSig().correctlySpends(tx, i, pubKey, Script.ALL_VERIFY_FLAGS);
+                }
+            } catch (RuntimeException e) {
+                throw new IllegalArgumentException("The withdrawal is not signed correctly, so it was not sent.");
+            }
+        }
+        long out = 0;
+        for (TransactionOutput o : tx.getOutputs()) out += o.getValue().value;
+        return new Finished(hex(tx.serialize()), in - out);
+    }
+
+    private static byte[] decode(String text) {
+        String t = text.trim().replaceAll("\\s+", "");
+        if (t.length() % 2 == 0 && t.matches("(?i)[0-9a-f]+")) {
+            byte[] b = new byte[t.length() / 2];
+            for (int i = 0; i < b.length; i++) b[i] = (byte) Integer.parseInt(t.substring(2 * i, 2 * i + 2), 16);
+            return b;
+        }
+        try {
+            return java.util.Base64.getDecoder().decode(t);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("That is not a withdrawal this app can read.");
+        }
+    }
+
+    private static String hex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        for (byte x : b) sb.append(String.format("%02x", x));
+        return sb.toString();
+    }
+
+    /**
+     * A smaller copy of a request for a slow link (an NFC tap): the full previous transaction of each native segwit coin
+     * is dropped and only the spent output stays. The signing device then reads each coin's amount from the request
+     * instead of checking it against the previous transaction. The transaction itself is unchanged, so a result signed from
+     * this still matches the full request.
+     */
+    public static Psbt compact(Psbt request) {
+        Psbt copy = Psbt.parse(request.serialize());
+        for (int i = 0; i < copy.inputCount(); i++) {
+            TransactionOutput spent = copy.spentOutput(i);
+            if (spent != null && ScriptPattern.isP2WPKH(new Script(spent.getScriptBytes()))
+                    && copy.input(i).get(0x01) != null) {
+                copy.removeNonWitnessUtxo(i);
+            }
+        }
+        return copy;
+    }
+
     private static int[] fullPath(int[] origin, int[] rest) {
         int[] out = new int[origin.length + rest.length];
         System.arraycopy(origin, 0, out, 0, origin.length);

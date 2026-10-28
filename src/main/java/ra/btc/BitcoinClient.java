@@ -196,9 +196,29 @@ public interface BitcoinClient {
      * scan is still catching up, or, short of funds, with {@link #HEADER_MISSING_SATS}. Nothing is signed or sent.
      */
     String OPERATION_VAULT_WITHDRAWAL_REQUEST = "VAULT_WITHDRAWAL_REQUEST";
+    /**
+     * Checks what a signing device returned ({@link #HEADER_VAULT_PSBT}: base64 or hex) against the request it was given
+     * ({@link #HEADER_VAULT_REQUEST}): the same coins to the same outputs, signed, every signature valid. Replies the
+     * ready-to-broadcast {@link #HEADER_RAW_TX_HEX} and {@link #HEADER_NETWORK_FEE_SATS}, or an error fit to show the
+     * user. Sends nothing - broadcasting is {@link #OPERATION_BROADCAST_TRANSACTION}, after the user confirms.
+     */
+    String OPERATION_VAULT_WITHDRAWAL_FINISH = "VAULT_WITHDRAWAL_FINISH";
+    String HEADER_VAULT_REQUEST = "btc.vault.request";
+    /**
+     * A smaller copy of the request in {@link #HEADER_VAULT_REQUEST}, returned in {@link #HEADER_VAULT_PSBT}, for a slow
+     * link such as an NFC tap: the previous-transaction copies of native segwit coins are dropped. See
+     * {@code ra.btc.psbt.VaultWithdrawal#compact}.
+     */
+    String OPERATION_VAULT_WITHDRAWAL_COMPACT = "VAULT_WITHDRAWAL_COMPACT";
     String HEADER_VAULT_FINGERPRINT = "btc.vault.fingerprint";
     String HEADER_VAULT_PATH = "btc.vault.path";
     String HEADER_VAULT_SEND_ALL = "btc.vault.sendAll";
+    /**
+     * {@code true} on {@link #OPERATION_VAULT_WITHDRAWAL_REQUEST} when the caller knows a scan of this vault has finished
+     * before: the coins the wallet holds are then used even while it reconnects and catches up after a restart. Without
+     * it the request is refused until the scan is caught up, since a first scan's coin list may be incomplete.
+     */
+    String HEADER_VAULT_SCAN_COMPLETED_BEFORE = "btc.vault.scanCompletedBefore";
     String HEADER_VAULT_PSBT = "btc.vault.psbt";
     String HEADER_VAULT_CHANGE_SATS = "btc.vault.changeSats";
     String HEADER_VAULT_KEY = "btc.vault.key";

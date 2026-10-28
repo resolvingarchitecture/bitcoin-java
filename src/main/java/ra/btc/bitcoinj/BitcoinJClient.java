@@ -977,6 +977,23 @@ public class BitcoinJClient implements BitcoinClient {
                 vaultWithdrawalRequest(e);
                 break;
             }
+            case OPERATION_VAULT_WITHDRAWAL_FINISH: {
+                vaultWithdrawalFinish(e);
+                break;
+            }
+            case OPERATION_VAULT_WITHDRAWAL_COMPACT: {
+                String requestText = stringHeaderOrNull(e, HEADER_VAULT_REQUEST);
+                if (requestText == null) {
+                    e.addErrorMessage("compacting a withdrawal needs " + HEADER_VAULT_REQUEST);
+                    break;
+                }
+                try {
+                    e.setHeader(HEADER_VAULT_PSBT, ra.btc.psbt.VaultWithdrawal.compact(ra.btc.psbt.Psbt.parseText(requestText)).toBase64());
+                } catch (IllegalArgumentException ex) {
+                    e.addErrorMessage("That is not a withdrawal this app can read.");
+                }
+                break;
+            }
             case OPERATION_BROADCAST_TRANSACTION: {
                 String rawTxHex = stringHeaderOrNull(e, HEADER_RAW_TX_HEX);
                 if (rawTxHex == null) {
@@ -1336,6 +1353,25 @@ public class BitcoinJClient implements BitcoinClient {
         return sum;
     }
 
+    /** See {@link BitcoinClient#OPERATION_VAULT_WITHDRAWAL_FINISH}. Needs no wallet or network. */
+    private void vaultWithdrawalFinish(Envelope e) {
+        String signedText = stringHeaderOrNull(e, HEADER_VAULT_PSBT);
+        String requestText = stringHeaderOrNull(e, HEADER_VAULT_REQUEST);
+        if (signedText == null || requestText == null) {
+            e.addErrorMessage("finishing a withdrawal needs " + HEADER_VAULT_PSBT + " and " + HEADER_VAULT_REQUEST);
+            return;
+        }
+        try {
+            ra.btc.psbt.VaultWithdrawal.Finished done = ra.btc.psbt.VaultWithdrawal.finishAny(
+                    signedText, ra.btc.psbt.Psbt.parseText(requestText));
+            e.setHeader(HEADER_RAW_TX_HEX, done.rawTxHex());
+            e.setHeader(HEADER_NETWORK_FEE_SATS, String.valueOf(done.feeSats()));
+        } catch (IllegalArgumentException ex) {
+            e.addErrorMessage(ex.getMessage() != null && ex.getMessage().length() > 0 ? ex.getMessage()
+                    : "That is not a withdrawal this app can read.");
+        }
+    }
+
     /** See {@link BitcoinClient#OPERATION_VAULT_WITHDRAWAL_REQUEST}. */
     private synchronized void vaultWithdrawalRequest(Envelope e) {
         WalletAppKit k = vaultKit;
@@ -1343,9 +1379,10 @@ public class BitcoinJClient implements BitcoinClient {
             e.addErrorMessage("the vault is not being scanned yet");
             return;
         }
-        if (k.peerGroup() == null || k.chain() == null || k.peerGroup().getConnectedPeers().isEmpty()
-                || k.peerGroup().getMostCommonChainHeight() > k.chain().getBestChainHeight()) {
-            e.addErrorMessage("the vault is still scanning; its coins are not all known yet");
+        boolean scannedBefore = "true".equals(stringHeaderOrNull(e, HEADER_VAULT_SCAN_COMPLETED_BEFORE));
+        if (!scannedBefore && (k.peerGroup() == null || k.chain() == null || k.peerGroup().getConnectedPeers().isEmpty()
+                || k.peerGroup().getMostCommonChainHeight() > k.chain().getBestChainHeight())) {
+            e.addErrorMessage("the vault is still doing its first scan; its coins are not all known yet");
             return;
         }
         String destinationStr = stringHeaderOrNull(e, HEADER_ADDRESS);
