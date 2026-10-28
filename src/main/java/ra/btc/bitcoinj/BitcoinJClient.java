@@ -704,7 +704,8 @@ public class BitcoinJClient implements BitcoinClient {
         Route route = e.getRoute();
         String operation = route.getOperation();
         boolean forVault = OPERATION_VAULT_SCAN_START.equals(operation) || OPERATION_VAULT_SCAN_STATUS.equals(operation)
-                || OPERATION_VAULT_SCAN_CLEAR.equals(operation);
+                || OPERATION_VAULT_SCAN_CLEAR.equals(operation)
+                || OPERATION_VAULT_WITHDRAWAL_REQUEST.equals(operation);
         Context.propagate(forVault ? vaultContext : mainContext); // reading a transaction's confidence uses the thread's Context
         switch(operation) {
             case OPERATION_GET_BALANCE: {
@@ -970,6 +971,10 @@ public class BitcoinJClient implements BitcoinClient {
             }
             case OPERATION_VAULT_SCAN_CLEAR: {
                 clearVaultScan();
+                break;
+            }
+            case OPERATION_VAULT_WITHDRAWAL_REQUEST: {
+                vaultWithdrawalRequest(e);
                 break;
             }
             case OPERATION_BROADCAST_TRANSACTION: {
@@ -1329,6 +1334,86 @@ public class BitcoinJClient implements BitcoinClient {
             }
         }
         return sum;
+    }
+
+    /** See {@link BitcoinClient#OPERATION_VAULT_WITHDRAWAL_REQUEST}. */
+    private synchronized void vaultWithdrawalRequest(Envelope e) {
+        WalletAppKit k = vaultKit;
+        if (k == null || !k.isRunning()) {
+            e.addErrorMessage("the vault is not being scanned yet");
+            return;
+        }
+        if (k.peerGroup() == null || k.chain() == null || k.peerGroup().getConnectedPeers().isEmpty()
+                || k.peerGroup().getMostCommonChainHeight() > k.chain().getBestChainHeight()) {
+            e.addErrorMessage("the vault is still scanning; its coins are not all known yet");
+            return;
+        }
+        String destinationStr = stringHeaderOrNull(e, HEADER_ADDRESS);
+        String fingerprintStr = stringHeaderOrNull(e, HEADER_VAULT_FINGERPRINT);
+        String pathStr = stringHeaderOrNull(e, HEADER_VAULT_PATH);
+        String rateStr = stringHeaderOrNull(e, HEADER_FEE_RATE_SAT_PER_VBYTE);
+        if (destinationStr == null || fingerprintStr == null || pathStr == null || rateStr == null) {
+            e.addErrorMessage("a withdrawal needs " + HEADER_ADDRESS + ", " + HEADER_VAULT_FINGERPRINT + ", "
+                    + HEADER_VAULT_PATH + " and " + HEADER_FEE_RATE_SAT_PER_VBYTE);
+            return;
+        }
+        boolean all = "true".equals(stringHeaderOrNull(e, HEADER_VAULT_SEND_ALL));
+        try {
+            Address destination;
+            try {
+                destination = Address.fromString(params, destinationStr.trim());
+            } catch (AddressFormatException ex) {
+                e.addErrorMessage("That is not a valid Bitcoin address for this network.");
+                return;
+            }
+            long amount = all ? -1 : Long.parseLong(stringHeaderOrNull(e, HEADER_AMOUNT_SATS));
+            long rate = Long.parseLong(rateStr.trim());
+            byte[] fingerprint = decodeHex(fingerprintStr.trim());
+            if (fingerprint.length != 4) throw new IllegalArgumentException("the fingerprint is 8 hex characters");
+            int[] origin = parsePath(pathStr);
+
+            Wallet w = k.wallet();
+            List<TransactionOutput> coins = new ArrayList<>();
+            for (TransactionOutput o : w.calculateAllSpendCandidates(true, false)) {
+                if (o.getParentTransactionDepthInBlocks() >= BitcoinClient.requiredConfirmations(o.getValue().value)) coins.add(o);
+            }
+            Address change = w.currentChangeAddress();
+            ra.btc.psbt.VaultWithdrawal.KeyLookup keys = script -> {
+                org.bitcoinj.crypto.ECKey key = w.findKeyFromAddress(script.getToAddress(params));
+                if (!(key instanceof DeterministicKey)) return null;
+                org.bitcoinj.crypto.HDPath path = ((DeterministicKey) key).getPath();
+                int n = path.size();
+                return new ra.btc.psbt.VaultWithdrawal.KeyInfo(key.getPubKey(),
+                        new int[]{path.get(n - 2).i(), path.get(n - 1).i()});
+            };
+            ra.btc.psbt.VaultWithdrawal.Result r = ra.btc.psbt.VaultWithdrawal.build(coins, keys, destination, amount, rate,
+                    change, fingerprint, origin);
+            e.setHeader(HEADER_VAULT_PSBT, r.psbt().toBase64());
+            e.setHeader(HEADER_AMOUNT_SATS, String.valueOf(r.amountSats()));
+            e.setHeader(HEADER_NETWORK_FEE_SATS, String.valueOf(r.feeSats()));
+            e.setHeader(HEADER_VAULT_CHANGE_SATS, String.valueOf(r.changeSats()));
+        } catch (ra.btc.psbt.VaultWithdrawal.InsufficientFundsException ex) {
+            e.setHeader(HEADER_MISSING_SATS, String.valueOf(ex.missingSats));
+            e.addErrorMessage(ex.getMessage());
+        } catch (IllegalArgumentException | IllegalStateException | NullPointerException ex) {
+            e.addErrorMessage("could not build the withdrawal: " + ex.getMessage());
+        }
+    }
+
+
+    /** {@code 84'/0'/0'} (or with {@code h}) as child numbers with the hardened bit set. */
+    static int[] parsePath(String path) {
+        String t = path.trim();
+        if (t.isEmpty()) return new int[0];
+        String[] parts = t.split("/");
+        int[] out = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            String p = parts[i];
+            boolean hardened = p.endsWith("'") || p.endsWith("h") || p.endsWith("H");
+            int n = Integer.parseInt(hardened ? p.substring(0, p.length() - 1) : p);
+            out[i] = hardened ? (n | 0x80000000) : n;
+        }
+        return out;
     }
 
     private synchronized void clearVaultScan() {

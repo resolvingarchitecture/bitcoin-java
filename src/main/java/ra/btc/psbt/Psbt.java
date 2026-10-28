@@ -181,6 +181,11 @@ public final class Psbt {
         inputs.get(i).put(IN_WITNESS_UTXO, spent.serialize());
     }
 
+    /** The whole previous transaction of input {@code i}: how a signer verifies the amount, and the fee, of a legacy coin. */
+    public void setNonWitnessUtxo(int i, Transaction previous) {
+        inputs.get(i).put(IN_NON_WITNESS_UTXO, previous.serialize());
+    }
+
     /** The output input {@code i} spends, from its witness UTXO or the matching output of its full previous transaction. */
     public TransactionOutput spentOutput(int i) {
         Fields in = inputs.get(i);

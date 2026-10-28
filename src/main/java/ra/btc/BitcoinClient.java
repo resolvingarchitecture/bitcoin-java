@@ -187,6 +187,20 @@ public interface BitcoinClient {
     String OPERATION_VAULT_SCAN_STATUS = "VAULT_SCAN_STATUS";
     /** Stops the vault scan and deletes its chain and wallet files. */
     String OPERATION_VAULT_SCAN_CLEAR = "VAULT_SCAN_CLEAR";
+    /**
+     * Builds, from the coins the vault scan holds, a signing request (a PSBT, base64 in {@link #HEADER_VAULT_PSBT}) that
+     * pays {@link #HEADER_ADDRESS} {@link #HEADER_AMOUNT_SATS} - or everything when {@link #HEADER_VAULT_SEND_ALL} is
+     * {@code true} - at {@link #HEADER_FEE_RATE_SAT_PER_VBYTE}, with the change returning to the vault. The signer's
+     * {@link #HEADER_VAULT_FINGERPRINT} and {@link #HEADER_VAULT_PATH} go into the request so it finds its keys. Replies
+     * {@link #HEADER_AMOUNT_SATS}, {@link #HEADER_NETWORK_FEE_SATS} and {@link #HEADER_VAULT_CHANGE_SATS}; fails while the
+     * scan is still catching up, or, short of funds, with {@link #HEADER_MISSING_SATS}. Nothing is signed or sent.
+     */
+    String OPERATION_VAULT_WITHDRAWAL_REQUEST = "VAULT_WITHDRAWAL_REQUEST";
+    String HEADER_VAULT_FINGERPRINT = "btc.vault.fingerprint";
+    String HEADER_VAULT_PATH = "btc.vault.path";
+    String HEADER_VAULT_SEND_ALL = "btc.vault.sendAll";
+    String HEADER_VAULT_PSBT = "btc.vault.psbt";
+    String HEADER_VAULT_CHANGE_SATS = "btc.vault.changeSats";
     String HEADER_VAULT_KEY = "btc.vault.key";
     String HEADER_VAULT_TYPE = "btc.vault.type";
     /** Epoch seconds the vault scan starts from. */
