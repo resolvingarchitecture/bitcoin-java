@@ -418,6 +418,9 @@ public class BitcoinJClient implements BitcoinClient {
 
             @Override
             protected void onSetupCompleted() {
+                // bitcoinj holds a broadcast until about 80% of the maximum peer connections are up. Over Tor that can take
+                // minutes (a withdrawal sat unsent for four), and a few peers are plenty to start the spread.
+                peerGroup().setMinBroadcastConnections(3);
                 peerGroup().addConnectedEventListener((peer, count) ->
                         LOG.info("Bitcoin peer connected count=" + count + " peerHeight=" + peer.getBestHeight()));
                 peerGroup().addDisconnectedEventListener((peer, count) ->
@@ -981,6 +984,36 @@ public class BitcoinJClient implements BitcoinClient {
                 vaultWithdrawalFinish(e);
                 break;
             }
+            case OPERATION_TX_PEER_CHECK: {
+                String txidText = stringHeaderOrNull(e, HEADER_TXID);
+                if (txidText == null) {
+                    e.addErrorMessage("checking a transaction needs " + HEADER_TXID);
+                    break;
+                }
+                org.bitcoinj.base.Sha256Hash hash;
+                try {
+                    hash = org.bitcoinj.base.Sha256Hash.wrap(txidText.trim());
+                } catch (IllegalArgumentException ex) {
+                    e.addErrorMessage("That is not a transaction ID.");
+                    break;
+                }
+                List<org.bitcoinj.core.Peer> peers = new ArrayList<>(kit.peerGroup().getConnectedPeers());
+                List<java.util.concurrent.CompletableFuture<Transaction>> asked = new ArrayList<>();
+                for (org.bitcoinj.core.Peer peer : peers) asked.add(peer.getPeerMempoolTransaction(hash));
+                int have = 0;
+                long deadline = System.currentTimeMillis() + 20_000;
+                for (java.util.concurrent.CompletableFuture<Transaction> f : asked) {
+                    try {
+                        f.get(Math.max(1, deadline - System.currentTimeMillis()), TimeUnit.MILLISECONDS);
+                        have++;
+                    } catch (Exception ignored) {
+                        // not found, timed out or the peer left: it does not have it as far as we can tell
+                    }
+                }
+                e.setHeader(HEADER_PEERS_ASKED, String.valueOf(peers.size()));
+                e.setHeader(HEADER_PEERS_HAVE, String.valueOf(have));
+                break;
+            }
             case OPERATION_VAULT_WITHDRAWAL_COMPACT: {
                 String requestText = stringHeaderOrNull(e, HEADER_VAULT_REQUEST);
                 if (requestText == null) {
@@ -1021,7 +1054,20 @@ public class BitcoinJClient implements BitcoinClient {
                 try {
                     LOG.info("bitcoinj broadcast submitted txid=" + tx.getTxId()
                             + " connectedPeers=" + kit.peerGroup().getConnectedPeers().size());
+                    long declaredFee = -1;
+                    try {
+                        String feeText = stringHeaderOrNull(e, HEADER_NETWORK_FEE_SATS);
+                        if (feeText != null) declaredFee = Long.parseLong(feeText.trim());
+                    } catch (NumberFormatException ignored) {
+                        // the fee is only for the log
+                    }
+                    BroadcastTrace.begin(LOG, kit.peerGroup(), tx, declaredFee);
                     TransactionBroadcast broadcast = kit.peerGroup().broadcastTransaction(tx);
+                    final String traceId = tx.getTxId().toString().substring(0, 12);
+                    broadcast.setProgressCallback(progress ->
+                            LOG.info("trace " + traceId + ": " + String.format("%.0f", progress * 100) + "% of the peers it was sent to have announced it back"));
+                    broadcast.awaitSent().whenComplete((b, err) -> LOG.info("trace " + traceId + ": "
+                            + (err == null ? "handed to its first peers" : "could not be handed to peers: " + err)));
                     try {
                         // Bounded wait for real propagation confirmation, not just "we tried" -
                         // A timeout retains the durable retry: a write alone is not acceptance.

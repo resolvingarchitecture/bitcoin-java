@@ -205,6 +205,15 @@ public interface BitcoinClient {
     String OPERATION_VAULT_WITHDRAWAL_FINISH = "VAULT_WITHDRAWAL_FINISH";
     String HEADER_VAULT_REQUEST = "btc.vault.request";
     /**
+     * Asks every connected Bitcoin peer whether it has the transaction {@link #HEADER_TXID} in its mempool, and replies how
+     * many were asked ({@link #HEADER_PEERS_ASKED}) and how many had it ({@link #HEADER_PEERS_HAVE}), waiting up to 20
+     * seconds. No third party is involved: it is the wallet's own peers, over whatever route they use. A transaction a
+     * peer has already mined out of its mempool counts as not found, so ask soon after sending.
+     */
+    String OPERATION_TX_PEER_CHECK = "TX_PEER_CHECK";
+    String HEADER_PEERS_ASKED = "btc.peersAsked";
+    String HEADER_PEERS_HAVE = "btc.peersHave";
+    /**
      * A smaller copy of the request in {@link #HEADER_VAULT_REQUEST}, returned in {@link #HEADER_VAULT_PSBT}, for a slow
      * link such as an NFC tap: the previous-transaction copies of native segwit coins are dropped. See
      * {@code ra.btc.psbt.VaultWithdrawal#compact}.
