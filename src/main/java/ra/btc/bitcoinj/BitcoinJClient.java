@@ -173,7 +173,7 @@ public class BitcoinJClient implements BitcoinClient {
         // wallet to the vault is exactly that: the vault wallet's older "pending" copy then overwrites the main
         // wallet's "confirmed", and loading the vault wallet can fail outright ("source cannot be set again").
         // Threads with no Context of their own fall back to the last one made, so the main wallet's is made last.
-        vaultContext = new Context(params);
+        for (int i = 0; i < vaultContexts.length; i++) vaultContexts[i] = new Context(params);
         mainContext = new Context(params);
         Context.propagate(mainContext);
         this.network = network;
@@ -421,6 +421,9 @@ public class BitcoinJClient implements BitcoinClient {
                 // bitcoinj holds a broadcast until about 80% of the maximum peer connections are up. Over Tor that can take
                 // minutes (a withdrawal sat unsent for four), and a few peers are plenty to start the spread.
                 peerGroup().setMinBroadcastConnections(3);
+                // A watch-only vault only follows the chain, and each peer it uses is handed the vault's address filter, so
+                // it keeps fewer connections than the default: less load on Tor and fewer nodes learning its addresses.
+                if (watchKey != null) peerGroup().setMaxConnections(MAX_VAULT_PEERS);
                 peerGroup().addConnectedEventListener((peer, count) ->
                         LOG.info("Bitcoin peer connected count=" + count + " peerHeight=" + peer.getBestHeight()));
                 peerGroup().addDisconnectedEventListener((peer, count) ->
@@ -709,7 +712,7 @@ public class BitcoinJClient implements BitcoinClient {
         boolean forVault = OPERATION_VAULT_SCAN_START.equals(operation) || OPERATION_VAULT_SCAN_STATUS.equals(operation)
                 || OPERATION_VAULT_SCAN_CLEAR.equals(operation)
                 || OPERATION_VAULT_WITHDRAWAL_REQUEST.equals(operation);
-        Context.propagate(forVault ? vaultContext : mainContext); // reading a transaction's confidence uses the thread's Context
+        Context.propagate(forVault ? vaultContextFor(vaultId(e)) : mainContext); // reading a transaction's confidence uses the thread's Context
         switch(operation) {
             case OPERATION_GET_BALANCE: {
                 Coin available = kit.wallet().getBalance(Wallet.BalanceType.AVAILABLE);
@@ -973,7 +976,7 @@ public class BitcoinJClient implements BitcoinClient {
                 break;
             }
             case OPERATION_VAULT_SCAN_CLEAR: {
-                clearVaultScan();
+                clearVaultScan(vaultId(e));
                 break;
             }
             case OPERATION_VAULT_WITHDRAWAL_REQUEST: {
@@ -1278,13 +1281,56 @@ public class BitcoinJClient implements BitcoinClient {
 
     // -- vault scan --------------------------------------------------------
 
-    private WalletAppKit vaultKit;
-    private Context mainContext;
-    private Context vaultContext;
-    private String vaultFingerprint;
+    /** How many Bitcoin peers each vault scan keeps (the main wallet keeps bitcoinj's default). */
+    static final int MAX_VAULT_PEERS = 5;
 
-    private File vaultDirectory() {
-        return new File(kitDirectory(), "vault");
+    /** How many vaults can be scanned at once; each has its own chain, peers and bitcoinj Context. */
+    static final int MAX_VAULTS = 8;
+
+    /** One vault being scanned: its wallet and chain, and the Context they run in. */
+    private static final class VaultScan {
+        final WalletAppKit kit;
+        final String fingerprint;
+        final int slot;
+
+        VaultScan(WalletAppKit kit, String fingerprint, int slot) {
+            this.kit = kit;
+            this.fingerprint = fingerprint;
+            this.slot = slot;
+        }
+    }
+
+    private final Map<String, VaultScan> vaults = new HashMap<>();
+    private Context mainContext;
+    private final Context[] vaultContexts = new Context[MAX_VAULTS];
+
+    /** The caller's name for a vault; empty when it has only one (the original single-vault callers). */
+    private static String vaultId(Envelope e) {
+        String id = stringHeaderOrNull(e, HEADER_VAULT_ID);
+        return id == null ? "" : id.trim();
+    }
+
+    private static boolean validVaultId(String id) {
+        return id.isEmpty() || id.matches("[A-Za-z0-9_-]{1,32}");
+    }
+
+    /** The Context of the vault's scan if it has one, otherwise of the first slot no scan is using. */
+    private synchronized Context vaultContextFor(String id) {
+        VaultScan scan = vaults.get(id);
+        return vaultContexts[scan != null ? scan.slot : freeVaultSlot()];
+    }
+
+    private int freeVaultSlot() {
+        for (int i = 0; i < vaultContexts.length; i++) {
+            boolean used = false;
+            for (VaultScan v : vaults.values()) if (v.slot == i) used = true;
+            if (!used) return i;
+        }
+        return -1;
+    }
+
+    private File vaultDirectory(String id) {
+        return new File(kitDirectory(), id.isEmpty() ? "vault" : "vault-" + id);
     }
 
     private File kitDirectory() {
@@ -1292,14 +1338,19 @@ public class BitcoinJClient implements BitcoinClient {
     }
 
     /**
-     * The watch-only vault wallet, kept apart from the main wallet and its chain: replaying history from the
-     * vault's start date means a chain of its own, and the main wallet must not be reset to do it. Started from the
-     * nearest bundled checkpoint before the date, so only headers from there on are fetched.
+     * A watch-only vault wallet, kept apart from the main wallet and its chain (and from any other vault's): replaying
+     * history from the vault's start date means a chain of its own, and the main wallet must not be reset to do it.
+     * Started from the nearest bundled checkpoint before the date, so only headers from there on are fetched.
      */
     private synchronized void startVaultScan(Envelope e) {
+        String id = vaultId(e);
         String key = stringHeaderOrNull(e, HEADER_VAULT_KEY);
         String typeStr = stringHeaderOrNull(e, HEADER_VAULT_TYPE);
         String sinceStr = stringHeaderOrNull(e, HEADER_VAULT_SINCE);
+        if (!validVaultId(id)) {
+            e.addErrorMessage("invalid vault id");
+            return;
+        }
         if (key == null || sinceStr == null) {
             e.addErrorMessage("vault scan needs " + HEADER_VAULT_KEY + " and " + HEADER_VAULT_SINCE);
             return;
@@ -1319,12 +1370,13 @@ public class BitcoinJClient implements BitcoinClient {
             return;
         }
         String fingerprint = key.trim() + "|" + type + "|" + sinceSeconds;
-        if (vaultKit != null && fingerprint.equals(vaultFingerprint)
-                && vaultKit.state() != com.google.common.util.concurrent.Service.State.FAILED
-                && vaultKit.state() != com.google.common.util.concurrent.Service.State.TERMINATED) {
+        VaultScan running = vaults.get(id);
+        if (running != null && fingerprint.equals(running.fingerprint)
+                && running.kit.state() != com.google.common.util.concurrent.Service.State.FAILED
+                && running.kit.state() != com.google.common.util.concurrent.Service.State.TERMINATED) {
             return; // already scanning this vault
         }
-        File dir = vaultDirectory();
+        File dir = vaultDirectory(id);
         File marker = new File(dir, "vault.fingerprint");
         boolean sameAsOnDisk = false;
         try {
@@ -1333,31 +1385,36 @@ public class BitcoinJClient implements BitcoinClient {
         } catch (IOException ignored) {
             // treated as a different vault below: scan afresh
         }
-        stopVaultKit();
+        stopVaultKit(id);
+        int slot = freeVaultSlot();
+        if (slot < 0) {
+            e.addErrorMessage("too many vaults are being scanned (at most " + MAX_VAULTS + ")");
+            return;
+        }
         if (!sameAsOnDisk) deleteRecursively(dir);
 
         try {
             DeterministicKey account = DeterministicKey.deserializeB58(key.trim(), network);
             account.setCreationTime(java.time.Instant.ofEpochSecond(sinceSeconds));
-            WalletAppKit k = newKit(network, dir, "vault", type, initConfig, account, vaultContext, KeyChainGroupStructure.BIP32);
+            WalletAppKit k = newKit(network, dir, "vault", type, initConfig, account, vaultContexts[slot], KeyChainGroupStructure.BIP32);
             if (network != BitcoinNetwork.REGTEST) {
                 k.setCheckpoints(org.bitcoinj.core.CheckpointManager.openStream(params));
             }
             k.startAsync();
-            vaultKit = k;
-            vaultFingerprint = fingerprint;
+            vaults.put(id, new VaultScan(k, fingerprint, slot));
             if (!dir.exists() && !dir.mkdirs()) LOG.warning("could not create " + dir);
             java.nio.file.Files.write(marker.toPath(), fingerprint.getBytes(StandardCharsets.UTF_8));
-            LOG.info("vault scan started from " + java.time.Instant.ofEpochSecond(sinceSeconds));
+            LOG.info("vault scan " + (id.isEmpty() ? "" : id + " ") + "started from " + java.time.Instant.ofEpochSecond(sinceSeconds));
         } catch (RuntimeException | IOException ex) {
             LOG.log(java.util.logging.Level.WARNING, "vault scan failed to start", ex);
-            stopVaultKit();
+            stopVaultKit(id);
             e.addErrorMessage("could not start the vault scan: " + ex.getMessage());
         }
     }
 
     private synchronized void vaultScanStatus(Envelope e) {
-        WalletAppKit k = vaultKit;
+        VaultScan scan = vaults.get(vaultId(e));
+        WalletAppKit k = scan == null ? null : scan.kit;
         if (k == null || !k.isRunning()) {
             e.setHeader(HEADER_VAULT_SCAN_STATE, k == null ? "NONE" : "SYNCING");
             return;
@@ -1420,7 +1477,8 @@ public class BitcoinJClient implements BitcoinClient {
 
     /** See {@link BitcoinClient#OPERATION_VAULT_WITHDRAWAL_REQUEST}. */
     private synchronized void vaultWithdrawalRequest(Envelope e) {
-        WalletAppKit k = vaultKit;
+        VaultScan scan = vaults.get(vaultId(e));
+        WalletAppKit k = scan == null ? null : scan.kit;
         if (k == null || !k.isRunning()) {
             e.addErrorMessage("the vault is not being scanned yet");
             return;
@@ -1499,21 +1557,20 @@ public class BitcoinJClient implements BitcoinClient {
         return out;
     }
 
-    private synchronized void clearVaultScan() {
-        stopVaultKit();
-        deleteRecursively(vaultDirectory());
+    private synchronized void clearVaultScan(String id) {
+        stopVaultKit(id);
+        deleteRecursively(vaultDirectory(id));
     }
 
-    private void stopVaultKit() {
-        if (vaultKit == null) return;
+    private void stopVaultKit(String id) {
+        VaultScan scan = vaults.remove(id);
+        if (scan == null) return;
         try {
-            vaultKit.stopAsync();
-            vaultKit.awaitTerminated(30, TimeUnit.SECONDS);
+            scan.kit.stopAsync();
+            scan.kit.awaitTerminated(30, TimeUnit.SECONDS);
         } catch (RuntimeException | TimeoutException ex) {
             LOG.log(java.util.logging.Level.WARNING, "vault scan did not stop cleanly", ex);
         }
-        vaultKit = null;
-        vaultFingerprint = null;
     }
 
     private static void deleteRecursively(File f) {
@@ -1527,7 +1584,7 @@ public class BitcoinJClient implements BitcoinClient {
         // WalletAppKit auto-saves the wallet (default) and persists the SPV chain file itself;
         // stopAsync()/awaitTerminated() flushes both to disk.
         synchronized (this) {
-            stopVaultKit();
+            for (String id : new ArrayList<>(vaults.keySet())) stopVaultKit(id);
         }
         if (kit != null) {
             kit.stopAsync();

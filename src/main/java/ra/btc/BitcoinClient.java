@@ -231,6 +231,13 @@ public interface BitcoinClient {
     String HEADER_VAULT_PSBT = "btc.vault.psbt";
     String HEADER_VAULT_CHANGE_SATS = "btc.vault.changeSats";
     String HEADER_VAULT_KEY = "btc.vault.key";
+    /**
+     * Names one of several vaults on {@link #OPERATION_VAULT_SCAN_START}, {@link #OPERATION_VAULT_SCAN_STATUS},
+     * {@link #OPERATION_VAULT_SCAN_CLEAR} and {@link #OPERATION_VAULT_WITHDRAWAL_REQUEST}: 1 to 32 letters, digits,
+     * {@code -} or {@code _}. Each named vault has its own scan, chain and peers; up to eight at once. Left out, the
+     * operation is about the one unnamed vault.
+     */
+    String HEADER_VAULT_ID = "btc.vault.id";
     String HEADER_VAULT_TYPE = "btc.vault.type";
     /** Epoch seconds the vault scan starts from. */
     String HEADER_VAULT_SINCE = "btc.vault.since";
