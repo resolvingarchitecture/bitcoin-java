@@ -424,8 +424,17 @@ public class BitcoinJClient implements BitcoinClient {
                 // A watch-only vault only follows the chain, and each peer it uses is handed the vault's address filter, so
                 // it keeps fewer connections than the default: less load on Tor and fewer nodes learning its addresses.
                 if (watchKey != null) peerGroup().setMaxConnections(MAX_VAULT_PEERS);
-                peerGroup().addConnectedEventListener((peer, count) ->
-                        LOG.info("Bitcoin peer connected count=" + count + " peerHeight=" + peer.getBestHeight()));
+                peerGroup().addConnectedEventListener((peer, count) -> {
+                    LOG.info("Bitcoin peer connected count=" + count + " peerHeight=" + peer.getBestHeight());
+                    // A peer with no IP address (gossiped by hostname) breaks the wallet file once it announces a
+                    // transaction; this wallet reaches peers by IP, so drop it.
+                    if (peer.getAddress() == null || peer.getAddress().getAddr() == null) {
+                        LOG.warning("dropping a Bitcoin peer that has no IP address: " + peer.getAddress());
+                        peer.close();
+                    }
+                });
+                // Whenever the record of which peers announced a transaction changes, keep it free of peers with no address.
+                wallet().addTransactionConfidenceEventListener((w, tx) -> scrubAddresslessPeers(tx));
                 peerGroup().addDisconnectedEventListener((peer, count) ->
                         LOG.info("Bitcoin peer disconnected remaining=" + count
                                 + " services=" + (peer.getPeerVersionMessage() == null ? "no handshake"
@@ -715,7 +724,7 @@ public class BitcoinJClient implements BitcoinClient {
         Context.propagate(forVault ? vaultContextFor(vaultId(e)) : mainContext); // reading a transaction's confidence uses the thread's Context
         switch(operation) {
             case OPERATION_GET_BALANCE: {
-                Coin available = kit.wallet().getBalance(Wallet.BalanceType.AVAILABLE);
+                Coin available = kit.wallet().getBalance(new OwnChangeCoinSelector());
                 Coin estimated = kit.wallet().getBalance(Wallet.BalanceType.ESTIMATED);
                 e.setHeader(HEADER_AVAILABLE_SATS, String.valueOf(available.value));
                 e.setHeader(HEADER_BALANCE_SATS, String.valueOf(estimated.value));
@@ -807,8 +816,19 @@ public class BitcoinJClient implements BitcoinClient {
                     Address address = Address.fromString(params, addressStr);
                     long sats = Long.parseLong(amountStr);
                     SendRequest req = applyConfirmationPolicy(useAllInputsIfRequested(e, applyFeeRate(e, addFeeOutput(e, SendRequest.to(address, Coin.valueOf(sats))))));
-                    Wallet.SendResult result = kit.wallet().sendCoins(kit.peerGroup(), req);
-                    e.setHeader(HEADER_TXID, result.transaction().getTxId().toString());
+                    scrubAddresslessPeers(kit.wallet().getTransactions(true));
+                    // Commit first, broadcast second, as Wallet.sendCoins does, but with the two apart: once the spend is
+                    // committed it is a fact in the wallet whatever the network does, so a failure in the broadcast is
+                    // logged (with its stack) and the transaction ID still goes back, instead of the spend being reported
+                    // as failed while its coins are already gone.
+                    Transaction tx = kit.wallet().sendCoinsOffline(req);
+                    e.setHeader(HEADER_TXID, tx.getTxId().toString());
+                    try {
+                        broadcastWithPendingAncestors(tx);
+                    } catch (RuntimeException broadcastFailure) {
+                        LOG.log(java.util.logging.Level.WARNING, "send " + tx.getTxId()
+                                + " is committed in the wallet but its broadcast failed; it stays unrelayed until rebroadcast", broadcastFailure);
+                    }
                 } catch (AddressFormatException ex) {
                     e.addErrorMessage("invalid address: " + addressStr);
                 } catch (NumberFormatException ex) {
@@ -826,6 +846,8 @@ public class BitcoinJClient implements BitcoinClient {
                 } catch (RuntimeException ex) {
                     // Covers Wallet.TransactionCompletionException (itself a RuntimeException) and
                     // anything else sendCoins/Address.fromString can throw unchecked.
+                    // The reply carries only the message; the stack is what says where it came from.
+                    LOG.log(java.util.logging.Level.WARNING, "send failed", ex);
                     e.addErrorMessage("send failed: " + ex);
                 }
                 break;
@@ -841,6 +863,7 @@ public class BitcoinJClient implements BitcoinClient {
                     Address address = Address.fromString(params, addressStr);
                     long sats = Long.parseLong(amountStr);
                     SendRequest req = applyConfirmationPolicy(useAllInputsIfRequested(e, applyFeeRate(e, addFeeOutput(e, SendRequest.to(address, Coin.valueOf(sats))))));
+                    scrubAddresslessPeers(kit.wallet().getTransactions(true));
                     Transaction tx = kit.wallet().sendCoinsOffline(req);
                     e.setHeader(HEADER_TXID, tx.getTxId().toString());
                     e.setHeader(HEADER_RAW_TX_HEX, bytesToHex(tx.serialize()));
@@ -856,6 +879,7 @@ public class BitcoinJClient implements BitcoinClient {
                 } catch (RuntimeException ex) {
                     // Covers Wallet.TransactionCompletionException (itself a RuntimeException) and
                     // anything else sendCoinsOffline/Address.fromString can throw unchecked.
+                    LOG.log(java.util.logging.Level.WARNING, "offline send failed", ex);
                     e.addErrorMessage("offline send failed: " + ex);
                 }
                 break;
@@ -987,6 +1011,49 @@ public class BitcoinJClient implements BitcoinClient {
                 vaultWithdrawalFinish(e);
                 break;
             }
+            case OPERATION_LIST_UNRELAYED: {
+                // Unconfirmed sends of this wallet that no peer has been seen relaying: committed here, maybe never sent.
+                StringBuilder sb = new StringBuilder();
+                for (Transaction tx : kit.wallet().getPendingTransactions()) {
+                    org.bitcoinj.core.TransactionConfidence c = tx.getConfidence();
+                    if (c.getSource() == org.bitcoinj.core.TransactionConfidence.Source.SELF && c.numBroadcastPeers() == 0) {
+                        sb.append(tx.getTxId()).append('\n');
+                    }
+                }
+                e.addContent(sb.toString().getBytes(StandardCharsets.UTF_8));
+                break;
+            }
+            case OPERATION_REBROADCAST_TRANSACTION: {
+                String txidText = stringHeaderOrNull(e, HEADER_TXID);
+                if (txidText == null) {
+                    e.addErrorMessage("rebroadcasting a transaction needs " + HEADER_TXID);
+                    break;
+                }
+                Transaction tx;
+                try {
+                    tx = kit.wallet().getTransaction(org.bitcoinj.base.Sha256Hash.wrap(txidText.trim()));
+                } catch (IllegalArgumentException ex) {
+                    e.addErrorMessage("That is not a transaction ID.");
+                    break;
+                }
+                if (tx == null) {
+                    e.addErrorMessage("This wallet has no such transaction.");
+                    break;
+                }
+                if (tx.getConfidence().getConfidenceType() != org.bitcoinj.core.TransactionConfidence.ConfidenceType.PENDING) {
+                    e.addErrorMessage("Only an unconfirmed transaction can be sent again.");
+                    break;
+                }
+                try {
+                    scrubAddresslessPeers(tx);
+                    broadcastWithPendingAncestors(tx);
+                    e.setHeader(HEADER_TXID, tx.getTxId().toString());
+                } catch (RuntimeException ex) {
+                    LOG.log(java.util.logging.Level.WARNING, "rebroadcast of " + tx.getTxId() + " failed", ex);
+                    e.addErrorMessage("rebroadcast failed: " + ex);
+                }
+                break;
+            }
             case OPERATION_TX_PEER_CHECK: {
                 String txidText = stringHeaderOrNull(e, HEADER_TXID);
                 if (txidText == null) {
@@ -1065,6 +1132,13 @@ public class BitcoinJClient implements BitcoinClient {
                         // the fee is only for the log
                     }
                     BroadcastTrace.begin(LOG, kit.peerGroup(), tx, declaredFee);
+                    // Its unconfirmed parents first: the network refuses a child whose parent it has not seen.
+                    java.util.LinkedHashSet<Transaction> parents = new java.util.LinkedHashSet<>();
+                    collectUnrelayedAncestors(tx, parents, new java.util.HashSet<>());
+                    for (Transaction parent : parents) {
+                        LOG.info("sending unconfirmed parent " + parent.getTxId() + " ahead of " + tx.getTxId());
+                        kit.peerGroup().broadcastTransaction(parent);
+                    }
                     TransactionBroadcast broadcast = kit.peerGroup().broadcastTransaction(tx);
                     final String traceId = tx.getTxId().toString().substring(0, 12);
                     broadcast.setProgressCallback(progress ->
@@ -1151,13 +1225,99 @@ public class BitcoinJClient implements BitcoinClient {
     }
 
     /**
+     * bitcoinj's default selection, except that change from this wallet's own unconfirmed sends is spendable at once.
+     * bitcoinj's rule is to wait until a peer has been seen relaying the send back; when that never gets recorded (a send
+     * that errored part way, a peer with no usable address) the whole balance shows as locked behind a transaction that
+     * may be fine. Only the coins a pending send actually consumed are unavailable: they are spent.
+     */
+    static final class OwnChangeCoinSelector extends DefaultCoinSelector {
+        @Override
+        protected boolean shouldSelect(Transaction tx) {
+            return tx == null || isSpendableNow(tx);
+        }
+    }
+
+    /** A coin of a confirmed transaction, or of an unconfirmed one this wallet made itself. */
+    static boolean isSpendableNow(Transaction tx) {
+        org.bitcoinj.core.TransactionConfidence confidence = tx.getConfidence();
+        org.bitcoinj.core.TransactionConfidence.ConfidenceType type = confidence.getConfidenceType();
+        return type == org.bitcoinj.core.TransactionConfidence.ConfidenceType.BUILDING
+                || (type == org.bitcoinj.core.TransactionConfidence.ConfidenceType.PENDING
+                && confidence.getSource() == org.bitcoinj.core.TransactionConfidence.Source.SELF);
+    }
+
+    /**
+     * Sends {@code tx} to the network after any unconfirmed parent of it that no peer has been seen relaying. The network
+     * refuses a child whose parent it has not seen, and the wallet now lets a send spend the change of a pending one.
+     * Parents go first, oldest first.
+     */
+    void broadcastWithPendingAncestors(Transaction tx) {
+        java.util.LinkedHashSet<Transaction> ordered = new java.util.LinkedHashSet<>();
+        collectUnrelayedAncestors(tx, ordered, new java.util.HashSet<>());
+        for (Transaction parent : ordered) {
+            LOG.info("sending unconfirmed parent " + parent.getTxId() + " ahead of " + tx.getTxId());
+            kit.peerGroup().broadcastTransaction(parent);
+        }
+        kit.peerGroup().broadcastTransaction(tx);
+    }
+
+    private void collectUnrelayedAncestors(Transaction tx, java.util.Set<Transaction> ordered, java.util.Set<org.bitcoinj.base.Sha256Hash> seen) {
+        for (org.bitcoinj.core.TransactionInput input : tx.getInputs()) {
+            org.bitcoinj.base.Sha256Hash parentHash = input.getOutpoint().hash();
+            if (!seen.add(parentHash)) continue;
+            Transaction parent = kit.wallet().getTransaction(parentHash);
+            if (parent == null || parent.getConfidence().getConfidenceType() != org.bitcoinj.core.TransactionConfidence.ConfidenceType.PENDING
+                    || parent.getConfidence().numBroadcastPeers() > 0) {
+                continue;
+            }
+            collectUnrelayedAncestors(parent, ordered, seen); // its own parents before it
+            ordered.add(parent);
+        }
+    }
+
+    /**
+     * Removes from every transaction's record of the peers that announced it any peer with no IP address (one gossiped by
+     * hostname, such as an onion address). bitcoinj writes that record into the wallet file as raw IP bytes and fails on
+     * a peer without one, which fails every save and any send that triggers one. Returns how many entries it removed.
+     */
+    static int scrubAddresslessPeers(Iterable<Transaction> transactions) {
+        int removed = 0;
+        for (Transaction tx : transactions) {
+            removed += scrubAddresslessPeers(tx);
+        }
+        return removed;
+    }
+
+    @SuppressWarnings("unchecked")
+    static int scrubAddresslessPeers(Transaction tx) {
+        org.bitcoinj.core.TransactionConfidence confidence = tx.getConfidence();
+        boolean any = false;
+        for (org.bitcoinj.core.PeerAddress address : confidence.getBroadcastBy()) {
+            if (address.getAddr() == null) { any = true; break; }
+        }
+        if (!any) return 0;
+        try {
+            // No public way to drop one entry (clearBroadcastBy refuses while the transaction is pending).
+            java.lang.reflect.Field field = org.bitcoinj.core.TransactionConfidence.class.getDeclaredField("broadcastBy");
+            field.setAccessible(true);
+            java.util.List<org.bitcoinj.core.PeerAddress> list = (java.util.List<org.bitcoinj.core.PeerAddress>) field.get(confidence);
+            int before = list.size();
+            list.removeIf(a -> a.getAddr() == null);
+            return before - list.size();
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            LOG.log(java.util.logging.Level.WARNING, "could not remove address-less peers from " + tx.getTxId(), ex);
+            return 0;
+        }
+    }
+
+    /**
      * Makes a send spend only coins the wallet counts as spendable: a payment received from someone else must have the
      * confirmations {@link BitcoinClient#requiredConfirmations} asks for its size, and change from this wallet's own
      * sends is left to bitcoinj's usual rule. Without this, bitcoinj spends any coin with a single confirmation, so
      * the wallet could send funds its own balance still shows as locked. Applies to a "send everything" selector too.
      */
     private SendRequest applyConfirmationPolicy(SendRequest req) {
-        CoinSelector base = req.coinSelector != null ? req.coinSelector : DefaultCoinSelector.get(network);
+        CoinSelector base = req.coinSelector != null ? req.coinSelector : new OwnChangeCoinSelector();
         Wallet wallet = kit.wallet();
         req.coinSelector = (target, candidates) -> {
             java.util.List<TransactionOutput> allowed = new ArrayList<>();

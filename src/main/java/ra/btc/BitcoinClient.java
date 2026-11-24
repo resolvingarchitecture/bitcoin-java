@@ -211,6 +211,17 @@ public interface BitcoinClient {
      * peer has already mined out of its mempool counts as not found, so ask soon after sending.
      */
     String OPERATION_TX_PEER_CHECK = "TX_PEER_CHECK";
+    /**
+     * Lists this wallet's own sends that are still unconfirmed and that no peer has been seen relaying back: one transaction
+     * ID per line, content only. Such a transaction is committed in the wallet (its coins are spent) but may never have
+     * reached the network. {@link #OPERATION_REBROADCAST_TRANSACTION} sends it again.
+     */
+    String OPERATION_LIST_UNRELAYED = "LIST_UNRELAYED";
+    /**
+     * Sends a wallet transaction ({@link #HEADER_TXID}) to the network again, after any of its own unconfirmed parents (a
+     * child is refused by the network until its parent is known). Only for an unconfirmed transaction the wallet made.
+     */
+    String OPERATION_REBROADCAST_TRANSACTION = "REBROADCAST_TRANSACTION";
     String HEADER_PEERS_ASKED = "btc.peersAsked";
     String HEADER_PEERS_HAVE = "btc.peersHave";
     /**
